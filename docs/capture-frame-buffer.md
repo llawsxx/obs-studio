@@ -49,12 +49,17 @@ the next received frame still has the next ordinal.
 Let `T` be the configured OBS output interval and `S` a mapped/rebuilt capture
 timestamp. On each OBS output tick `O`:
 
-1. Discard queued frames with `O - S > 1.25 * T`.
-2. Select the oldest remaining frame with `0 <= O - S <= 1.25 * T`.
-3. Leave future frames (`S > O`) queued. Select at most one frame per output tick.
+1. Discard queued frames with `O - S > 0.6 * T`.
+2. Select the oldest remaining frame with `-0.6 * T <= S - O <= 0.6 * T`.
+3. Leave frames more than `0.6 * T` ahead queued. Select at most one frame per
+   output tick. An already queued frame may be consumed up to `0.6 * T` early;
+   this is not a prediction or generation of a frame that has not arrived.
 
-The equivalent signed range for `S - O` is `[-1.25*T, 0]`, not simply
-`S - O < 1.25*T`, which would also accept arbitrarily stale frames.
+The symmetric window uses mapped/rebuilt scheduling timestamps, which can be
+ahead of the OBS output timestamp even though the actual frame has arrived.
+The half-window is calculated as `floor(3*T/5)` in integer nanoseconds without
+overflowing intermediate multiplication or subtracting unsigned timestamps
+in the wrong order. The oldest eligible frame is selected, not the nearest one.
 
 When the queue empties, stop advancing playback and require the target count
 again. After prefill or overflow, anchor the retained oldest frame to that new
@@ -63,10 +68,12 @@ backward capture timestamps or a forward jump exceeding two seconds also clear
 pending frames and restart prefill. Rebuilt scheduling ignores device timestamp
 discontinuities.
 
-Example at OBS 60 FPS: the eligible age range is approximately 0–20.833 ms.
-If two pending frames are 20 ms and 4 ms old, select the 20 ms-old frame and remove
-it. If six frames accumulate with target 2 / maximum 5, discard four oldest
-frames, retain two, and re-anchor the older retained frame on the next output
+Example at OBS 60 FPS: the eligible signed difference is approximately ±10 ms.
+If pending frames are 8 ms old and 4 ms ahead, select the 8 ms-old frame and remove
+it. A queued frame 4 ms ahead is also eligible when no older eligible frame
+exists. A frame 20 ms old is discarded. If six frames accumulate with target 2 /
+maximum 5, discard four oldest frames, retain two, and re-anchor the older
+retained frame on the next output
 tick. A 120 FPS capture feeding a 60 FPS output necessarily discards frames;
 a 30 FPS capture cannot create 60 distinct frames per second.
 
@@ -84,6 +91,14 @@ other asynchronous video sources, but no other source is automatically changed.
 Normal and deinterlaced async selection both use the new scheduler when enabled.
 This happens before scene composition, so it affects preview, recording,
 streaming, and virtual camera, unlike buffered preview presentation.
+
+Buffered preview presentation is unchanged: its frame timestamp is the actual
+CPU render-start time, not a mapped or synthetic playback deadline. Completed
+preview frames cannot have actual render-start timestamps in the future. Using
+a symmetric ±0.6-display-period window around the current presentation attempt
+would therefore only allow ages 0–0.6 periods, not provide look-ahead. Supporting
+early selection there would require a separate presentation timeline/reference
+clock; merely changing the bounds can reject more GPU-ready frames.
 
 ## Validation
 

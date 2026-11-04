@@ -109,7 +109,7 @@ async_frame_buffer_select(struct async_frame_buffer *buffer, const struct obs_as
 		buffer->remainder = 0;
 		buffer->playing = true;
 	}
-	const uint64_t maximum_age = output_interval + output_interval / 4;
+	const uint64_t tolerance = output_interval / 5 * 3 + output_interval % 5 * 3 / 5;
 	for (size_t index = 0; index < count; index++) {
 		uint64_t timestamp = buffer->next_timestamp;
 		if (!config->rebuild_timestamps) {
@@ -120,11 +120,11 @@ async_frame_buffer_select(struct async_frame_buffer *buffer, const struct obs_as
 			}
 			timestamp = buffer->output_anchor + capture_timestamps[index] - buffer->capture_anchor;
 		}
-		if (timestamp > output_timestamp)
+		if (timestamp > output_timestamp && timestamp - output_timestamp > tolerance)
 			return result;
 		if (config->rebuild_timestamps)
 			async_frame_buffer_advance(buffer, config);
-		if (output_timestamp - timestamp <= maximum_age) {
+		if (timestamp >= output_timestamp || output_timestamp - timestamp <= tolerance) {
 			result.output = true;
 			buffer->playing = index + 1 < count;
 			return result;

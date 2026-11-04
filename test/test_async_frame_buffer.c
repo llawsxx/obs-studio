@@ -77,7 +77,7 @@ static void test_prefill_underrun_and_restart(bool rebuild)
 	CHECK(select_frame(&queue, now, interval));
 	CHECK(queue.last_output == 1 && queue.count == 1);
 	CHECK(queue.buffer.output_anchor == now);
-	CHECK(!select_frame(&queue, now + 10000000, interval));
+	CHECK(!select_frame(&queue, now + 5000000, interval));
 	CHECK(select_frame(&queue, now + interval, interval));
 	CHECK(queue.last_output == 2 && queue.count == 0 && !queue.buffer.playing);
 	CHECK(!select_frame(&queue, now + 2 * interval, interval));
@@ -123,32 +123,63 @@ static void test_overflow_and_limits(void)
 	CHECK(queue.last_output == 3);
 }
 
-static void test_age_boundaries_and_oldest_selection(void)
+static void test_age_boundaries_and_oldest_selection(bool rebuild)
 {
 	const uint64_t now = 90000000000ULL;
 	const uint64_t interval = 20000000;
-	const uint64_t timestamps[] = {1000000000, 1010000000, 1020000000};
+	const uint64_t timestamps[] = {1000000000, 1020000000, 1040000000};
 	for (uint64_t extra = 0; extra < 2; extra++) {
 		struct async_frame_buffer buffer = {0};
-		struct obs_async_buffer_config config = default_config(false);
+		struct obs_async_buffer_config config = default_config(rebuild);
+		config.fps_numerator = 50;
 		struct async_frame_buffer_selection selection =
 			async_frame_buffer_select(&buffer, &config, timestamps, 3, now, interval);
 		CHECK(selection.output && selection.discard == 0);
-		selection = async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, now + 35000000 + extra,
+		selection = async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, now + 32000000 + extra,
 						      interval);
 		CHECK(selection.output && selection.discard == extra);
 	}
 	struct async_frame_buffer buffer = {0};
-	struct obs_async_buffer_config config = default_config(false);
+	struct obs_async_buffer_config config = default_config(rebuild);
+	config.fps_numerator = 50;
 	CHECK(async_frame_buffer_select(&buffer, &config, timestamps, 3, now, interval).output);
 	struct async_frame_buffer_selection selection =
-		async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, now + 9999999, interval);
+		async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, now + 7999999, interval);
 	CHECK(!selection.output && selection.discard == 0 && buffer.playing);
-	selection = async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, now + 10000000, interval);
+	selection = async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, now + 8000000, interval);
 	CHECK(selection.output && selection.discard == 0);
-	selection = async_frame_buffer_select(&buffer, &config, timestamps + 2, 1, now + 50000000, interval);
+	selection = async_frame_buffer_select(&buffer, &config, timestamps + 2, 1, now + 40000000, interval);
+	CHECK(selection.output && selection.discard == 0 && !buffer.playing);
+	async_frame_buffer_reset(&buffer);
+	CHECK(async_frame_buffer_select(&buffer, &config, timestamps, 3, now, interval).output);
+	selection = async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, now + 60000000, interval);
+	CHECK(!selection.output && selection.discard == 2 && !buffer.playing);
+	CHECK(!async_frame_buffer_select(&buffer, &config, timestamps + 2, 1, now + 70000000, interval).output);
+}
+
+static void test_window_near_unsigned_limits(void)
+{
+	const uint64_t anchors[] = {0, UINT64_MAX - 1000000000};
+	const uint64_t timestamps[] = {1000000000, 1020000000};
+	for (size_t index = 0; index < sizeof(anchors) / sizeof(anchors[0]); index++) {
+		struct async_frame_buffer buffer = {0};
+		struct obs_async_buffer_config config = default_config(true);
+		config.fps_numerator = 50;
+		CHECK(async_frame_buffer_select(&buffer, &config, timestamps, 2, anchors[index], 20000000).output);
+		CHECK(!async_frame_buffer_select(&buffer, &config, timestamps + 1, 1, anchors[index] + 7999999,
+						 20000000)
+			       .output);
+		CHECK(async_frame_buffer_select(&buffer, &config, timestamps + 1, 1, anchors[index] + 8000000, 20000000)
+			      .output);
+	}
+	struct async_frame_buffer buffer = {0};
+	struct obs_async_buffer_config config = default_config(true);
+	config.target_frames = 1;
+	config.fps_numerator = 50;
+	CHECK(async_frame_buffer_select(&buffer, &config, timestamps, 2, 0, UINT64_MAX).output);
+	const struct async_frame_buffer_selection selection =
+		async_frame_buffer_select(&buffer, &config, timestamps + 1, 1, UINT64_MAX, UINT64_MAX);
 	CHECK(!selection.output && selection.discard == 1 && !buffer.playing);
-	CHECK(!async_frame_buffer_select(&buffer, &config, timestamps + 2, 1, now + 60000000, interval).output);
 }
 
 static void test_rebuilt_clock_ignores_device_spacing(void)
@@ -160,9 +191,9 @@ static void test_rebuilt_clock_ignores_device_spacing(void)
 	const uint64_t original[] = {3000000000, 0, 123};
 	CHECK(async_frame_buffer_select(&buffer, &config, timestamps, 3, 1000000000, 20000000).output);
 	CHECK(buffer.next_timestamp == 1020000000);
-	CHECK(!async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, 1019999999, 20000000).output);
+	CHECK(!async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, 1007999999, 20000000).output);
 	CHECK(buffer.next_timestamp == 1020000000);
-	CHECK(async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, 1020000000, 20000000).output);
+	CHECK(async_frame_buffer_select(&buffer, &config, timestamps + 1, 2, 1008000000, 20000000).output);
 	CHECK(buffer.next_timestamp == 1040000000);
 	CHECK(!memcmp(timestamps, original, sizeof(original)));
 }
@@ -286,7 +317,9 @@ int main(void)
 	test_prefill_underrun_and_restart(false);
 	test_prefill_underrun_and_restart(true);
 	test_overflow_and_limits();
-	test_age_boundaries_and_oldest_selection();
+	test_age_boundaries_and_oldest_selection(false);
+	test_age_boundaries_and_oldest_selection(true);
+	test_window_near_unsigned_limits();
 	test_rebuilt_clock_ignores_device_spacing();
 	test_fractional_clock_no_accumulated_rounding();
 	test_native_discontinuity_and_reset();
@@ -300,10 +333,10 @@ int main(void)
 	test_cadence(120, 1, 600, true);
 	test_cadence(30, 1, 300, false);
 	test_cadence(30, 1, 300, true);
-	test_cadence(60000, 1001, 600, false);
-	test_cadence(60000, 1001, 600, true);
-	test_cadence(30000, 1001, 300, false);
-	test_cadence(30000, 1001, 300, true);
+	test_cadence(60000, 1001, 599, false);
+	test_cadence(60000, 1001, 599, true);
+	test_cadence(30000, 1001, 299, false);
+	test_cadence(30000, 1001, 299, true);
 	puts("async frame buffer tests passed");
 	return 0;
 }
