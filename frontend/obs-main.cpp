@@ -168,7 +168,8 @@ static inline bool too_many_repeated_entries(fstream &logFile, const char *msg, 
 
 	lock_guard<mutex> guard(log_mutex);
 
-	if (unfiltered_log) {
+	if (unfiltered_log || strncmp(msg, "[obs-display-stats]", sizeof("[obs-display-stats]") - 1) == 0 ||
+	    strncmp(msg, "[obs-preview-sync]", sizeof("[obs-preview-sync]") - 1) == 0) {
 		return false;
 	}
 
