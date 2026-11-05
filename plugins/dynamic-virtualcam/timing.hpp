@@ -25,6 +25,7 @@ inline uint64_t mul_div(uint64_t value, uint64_t multiplier, uint64_t divisor)
 struct Rate {
 	uint32_t numerator = 60;
 	uint32_t denominator = 1;
+	bool fixed_interval = false;
 
 	bool valid() const
 	{
@@ -32,18 +33,31 @@ struct Rate {
 		       numerator >= denominator && uint64_t(numerator) <= uint64_t(denominator) * 1000;
 	}
 
-	uint64_t offset(uint64_t index) const { return mul_div(index, uint64_t(1000000000) * denominator, numerator); }
+	uint64_t offset(uint64_t index) const
+	{
+		const uint64_t period = uint64_t(1000000000) * denominator;
+		return fixed_interval ? index * (period / numerator) : mul_div(index, period, numerator);
+	}
+
+	uint64_t index_at(uint64_t elapsed) const
+	{
+		return fixed_interval ? elapsed / offset(1)
+				      : mul_div(elapsed, numerator, uint64_t(1000000000) * denominator);
+	}
 
 	uint64_t after(uint64_t elapsed) const
 	{
-		uint64_t index = mul_div(elapsed, numerator, uint64_t(1000000000) * denominator) + 1;
+		uint64_t index = index_at(elapsed) + 1;
 		while (offset(index) <= elapsed) {
 			++index;
 		}
 		return index;
 	}
 
-	uint64_t window() const { return mul_div(600000000, denominator, numerator); }
+	uint64_t window() const
+	{
+		return fixed_interval ? offset(1) * 3 / 5 : mul_div(600000000, denominator, numerator);
+	}
 };
 
 inline bool eligible(uint64_t sequence, uint64_t consumed, uint64_t timestamp, uint64_t now, Rate rate)

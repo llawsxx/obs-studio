@@ -43,7 +43,7 @@ Camera::Camera(const std::wstring &session, REFCLSID id) : class_id(id)
 		const auto *header = queue.header();
 		width = header->width;
 		height = header->height;
-		rate = {header->fps_num, header->fps_den};
+		rate = {header->fps_num, header->fps_den, header->fixed_interval != 0};
 		format = PixelFormat(header->pixel_format);
 		static std::atomic<uint64_t> serial{0};
 		token = now_ns() + ++serial;
@@ -112,7 +112,8 @@ HRESULT Camera::GetClassID(CLSID *output)
 HRESULT Camera::Stop()
 {
 	std::lock_guard transition(lifecycle);
-	if (worker.joinable() && worker.get_id() == std::this_thread::get_id()) {
+	if ((worker.joinable() && worker.get_id() == std::this_thread::get_id()) ||
+	    (collector.joinable() && collector.get_id() == std::this_thread::get_id())) {
 		return VFW_E_WRONG_STATE;
 	}
 	ComPtr<IPin> target;
@@ -130,9 +131,13 @@ HRESULT Camera::Stop()
 	if (buffers) {
 		buffers->Decommit();
 	}
+	if (collector.joinable()) {
+		collector.join();
+	}
 	if (worker.joinable()) {
 		worker.join();
 	}
+	received_frames.reset();
 	if (target) {
 		target->EndFlush();
 	}
@@ -175,6 +180,15 @@ HRESULT Camera::Run(REFERENCE_TIME start)
 		}
 		ResetEvent(stop_event);
 		try {
+			received_frames = std::make_unique<FrameCache>(rate, queue.header()->target_frames,
+								       queue.header()->slots);
+			collector = std::thread([this] {
+				try {
+					collect();
+				} catch (...) {
+					SetEvent(stop_event);
+				}
+			});
 			worker = std::thread([this] {
 				CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 				try {
@@ -185,6 +199,11 @@ HRESULT Camera::Run(REFERENCE_TIME start)
 				CoUninitialize();
 			});
 		} catch (...) {
+			SetEvent(stop_event);
+			if (collector.joinable()) {
+				collector.join();
+			}
+			received_frames.reset();
 			allocator->Decommit();
 			return E_OUTOFMEMORY;
 		}

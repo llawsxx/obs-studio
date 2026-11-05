@@ -51,6 +51,8 @@ DevicePanel::DevicePanel(QWidget *parent, const std::wstring &id, const QString 
 	}
 	pixel_format->setToolTip(obs_module_text("PixelFormatHelp"));
 	follow_obs_fps = new QCheckBox(this);
+	use_obs_interval = new QCheckBox(obs_module_text("UseObsInterval"), this);
+	use_obs_interval->setToolTip(obs_module_text("UseObsIntervalHelp"));
 	test_card = new QComboBox(this);
 	test_card->addItems({obs_module_text("TestCardOff"), obs_module_text("TestCardMotion")});
 	test_card->setToolTip(obs_module_text("TestCardHelp"));
@@ -80,6 +82,7 @@ DevicePanel::DevicePanel(QWidget *parent, const std::wstring &id, const QString 
 	form->addRow(obs_module_text("OutputSelection"), selection);
 	form->addRow(obs_module_text("PixelFormat"), pixel_format);
 	form->addRow(follow_obs_fps);
+	form->addRow(use_obs_interval);
 	form->addRow(obs_module_text("FpsNumerator"), numerator);
 	form->addRow(obs_module_text("FpsDenominator"), denominator);
 	form->addRow(obs_module_text("BufferTarget"), target_frames);
@@ -138,6 +141,14 @@ DevicePanel::DevicePanel(QWidget *parent, const std::wstring &id, const QString 
 		update_phase_range();
 		save_settings();
 	});
+	connect(use_obs_interval, &QCheckBox::toggled, this, [this](bool enabled) {
+		if (enabled) {
+			follow_obs_fps->setChecked(true);
+		}
+		follow_obs_fps->setEnabled(!output && !enabled);
+		update_phase_range();
+		save_settings();
+	});
 	connect(toggle, &QPushButton::clicked, this, [this] {
 		if (output) {
 			if (has_receivers() &&
@@ -188,8 +199,11 @@ void DevicePanel::load_settings(bool migrate)
 				 obs_data_has_user_value(settings, "slots") ? obs_data_get_int(settings, "slots") : 5);
 	obs_data_set_default_int(settings, "target_frames", 2);
 	obs_data_set_default_bool(settings, "follow_obs_fps", true);
+	obs_data_set_default_bool(settings, "use_obs_interval", false);
 	obs_data_set_default_int(settings, "pixel_format", int(PixelFormat::NV12));
-	follow_obs_fps->setChecked(obs_data_get_bool(settings, "follow_obs_fps"));
+	use_obs_interval->setChecked(obs_data_get_bool(settings, "use_obs_interval"));
+	follow_obs_fps->setChecked(obs_data_get_bool(settings, "follow_obs_fps") || use_obs_interval->isChecked());
+	follow_obs_fps->setEnabled(!use_obs_interval->isChecked());
 	pixel_format->setCurrentIndex(
 		std::max(0, pixel_format->findData(int(obs_data_get_int(settings, "pixel_format")))));
 	type->setCurrentIndex(std::clamp(int(obs_data_get_int(settings, "type")), 0, 3));
@@ -218,6 +232,7 @@ void DevicePanel::save_settings()
 	obs_data_set_int(settings, "target_frames", target_frames->value());
 	obs_data_set_int(settings, "pixel_format", pixel_format->currentData().toInt());
 	obs_data_set_bool(settings, "follow_obs_fps", follow_obs_fps->isChecked());
+	obs_data_set_bool(settings, "use_obs_interval", use_obs_interval->isChecked());
 	obs_data_set_int(settings, "test_card", test_card->currentIndex());
 	obs_data_set_int(settings, "phase_ns", phase->value());
 	char *directory = obs_module_config_path("");
@@ -237,10 +252,10 @@ Rate DevicePanel::effective_rate() const
 			return context->rate;
 		}
 	}
-	if (follow_obs_fps->isChecked()) {
+	if (follow_obs_fps->isChecked() || use_obs_interval->isChecked()) {
 		obs_video_info info = {};
 		if (obs_get_video_info(&info)) {
-			return {info.fps_num, info.fps_den};
+			return {info.fps_num, info.fps_den, use_obs_interval->isChecked()};
 		}
 	}
 	return {uint32_t(numerator->value()), uint32_t(denominator->value())};
@@ -457,6 +472,7 @@ bool DevicePanel::start()
 	obs_data_set_int(parameters, "target_frames", target_frames->value());
 	obs_data_set_int(parameters, "pixel_format", pixel_format->currentData().toInt());
 	obs_data_set_bool(parameters, "follow_obs_fps", follow_obs_fps->isChecked());
+	obs_data_set_bool(parameters, "use_obs_interval", use_obs_interval->isChecked());
 	obs_data_set_int(parameters, "test_card", test_card->currentIndex());
 	obs_data_set_int(parameters, "phase_ns", phase->value());
 	const QByteArray output_name = ("DVC-" + QString::fromStdWString(device_id)).toUtf8();
@@ -495,8 +511,8 @@ bool DevicePanel::start()
 	}
 	update_phase_range();
 	save_settings();
-	for (auto *widget : std::array<QWidget *, 8>{type, selection, numerator, denominator, slots, target_frames,
-						     pixel_format, follow_obs_fps}) {
+	for (auto *widget : std::array<QWidget *, 9>{type, selection, numerator, denominator, slots, target_frames,
+						     pixel_format, follow_obs_fps, use_obs_interval}) {
 		widget->setEnabled(false);
 	}
 	toggle->setText(obs_module_text("Stop"));
@@ -538,10 +554,11 @@ void DevicePanel::stop()
 	previous_delivered = previous_repeated = 0;
 	previous_published = 0;
 	statistics->clear();
-	for (auto *widget : std::array<QWidget *, 8>{type, selection, numerator, denominator, slots, target_frames,
-						     pixel_format, follow_obs_fps}) {
+	for (auto *widget : std::array<QWidget *, 9>{type, selection, numerator, denominator, slots, target_frames,
+						     pixel_format, follow_obs_fps, use_obs_interval}) {
 		widget->setEnabled(true);
 	}
+	follow_obs_fps->setEnabled(!use_obs_interval->isChecked());
 	numerator->setEnabled(!follow_obs_fps->isChecked());
 	denominator->setEnabled(!follow_obs_fps->isChecked());
 	selection->setEnabled(type->currentIndex() >= 2);
@@ -583,11 +600,13 @@ void DevicePanel::refresh_statistics()
 	}
 	status->setText(obs_module_text(context->card_failed ? "TestCardFailed" : "Running"));
 	auto &queue = *context->queue;
+	const uint64_t time = now_ns();
+	const bool log_clients = statistics_time && time - statistics_time >= 5000000000;
 	if (!queue.lock_control(0)) {
 		return;
 	}
 	uint64_t instances = 0, streaming = 0, expired = 0, prepare = 0, receive = 0, late = 0;
-	uint64_t buffered = 0, rebuffers = 0;
+	uint64_t buffered = 0, rebuffers = 0, capture_skipped = 0;
 	uint32_t result = 0;
 	for (auto &client : queue.header()->clients) {
 		if (!client.pid) {
@@ -602,11 +621,36 @@ void DevicePanel::refresh_statistics()
 		expired += load(client.expired);
 		buffered = std::max(buffered, load(client.buffered));
 		rebuffers += load(client.rebuffers);
+		capture_skipped += load(client.capture_skipped);
 		prepare = std::max(prepare, load(client.prepare_ns));
 		receive = std::max(receive, load(client.receive_ns));
 		late = std::max(late, load(client.late_ns));
 		if (load(client.last_result)) {
 			result = uint32_t(load(client.last_result));
+		}
+		if (log_clients) {
+			const uint64_t receive_start = load(client.receive_start_ns);
+			const uint64_t receive_active = receive_start && time > receive_start ? time - receive_start
+											      : 0;
+			blog(LOG_INFO,
+			     "[dynamic-virtualcam-client] id=%s token=%llu pid=%lu streaming=%llu delivered=%llu repeated=%llu "
+			     "expired=%llu buffered=%llu rebuffers=%llu captured=%llu capture_skipped=%llu read_contentions=%llu read_timeouts=%llu "
+			     "pts_skipped=%llu pts_late_ms=%.3f last_receive_ms=%.3f max_receive_ms=%.3f receive_active_ms=%.3f",
+			     QString::fromStdWString(device_id).toUtf8().constData(),
+			     static_cast<unsigned long long>(client.token), static_cast<unsigned long>(client.pid),
+			     static_cast<unsigned long long>(load(client.streaming)),
+			     static_cast<unsigned long long>(load(client.delivered)),
+			     static_cast<unsigned long long>(load(client.repeated)),
+			     static_cast<unsigned long long>(load(client.expired)),
+			     static_cast<unsigned long long>(load(client.buffered)),
+			     static_cast<unsigned long long>(load(client.rebuffers)),
+			     static_cast<unsigned long long>(load(client.captured)),
+			     static_cast<unsigned long long>(load(client.capture_skipped)),
+			     static_cast<unsigned long long>(load(client.read_contentions)),
+			     static_cast<unsigned long long>(load(client.read_timeouts)),
+			     static_cast<unsigned long long>(load(client.pts_skipped)),
+			     double(load(client.pts_late_ns)) / 1000000.0, double(load(client.receive_ns)) / 1000000.0,
+			     double(load(client.max_receive_ns)) / 1000000.0, double(receive_active) / 1000000.0);
 		}
 	}
 	queue.unlock_control();
@@ -621,8 +665,8 @@ void DevicePanel::refresh_statistics()
 				    .arg(double(prepare) / 1000000.0, 0, 'f', 3)
 				    .arg(double(receive) / 1000000.0, 0, 'f', 3)
 				    .arg(buffered)
-				    .arg(rebuffers));
-	const uint64_t time = now_ns();
+				    .arg(rebuffers)
+				    .arg(capture_skipped));
 	if (!statistics_time) {
 		statistics_time = time;
 		previous_delivered = delivered;

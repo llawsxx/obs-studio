@@ -71,6 +71,7 @@ bool Queue::create(const std::wstring &session, uint32_t width, uint32_t height,
 	shared->target_frames = target_frames;
 	shared->fps_num = rate.numerator;
 	shared->fps_den = rate.denominator;
+	shared->fixed_interval = rate.fixed_interval;
 	shared->owner_pid = GetCurrentProcessId();
 	shared->pixel_format = uint32_t(format);
 	shared->owner_start = process_start(GetCurrentProcess());
@@ -81,6 +82,16 @@ bool Queue::create(const std::wstring &session, uint32_t width, uint32_t height,
 		locks[index].reset(CreateMutexW(
 			nullptr, FALSE, object_name(session, (L"slot" + std::to_wstring(index)).c_str()).c_str()));
 		if (!locks[index]) {
+			return false;
+		}
+	}
+	for (size_t index = 0; index < max_clients; ++index) {
+		reader_locks[index].reset(CreateMutexW(
+			nullptr, FALSE, object_name(session, (L"reader" + std::to_wstring(index)).c_str()).c_str()));
+		notifications[index].reset(
+			CreateEventW(nullptr, FALSE, FALSE,
+				     object_name(session, (L"frame" + std::to_wstring(index)).c_str()).c_str()));
+		if (!reader_locks[index] || !notifications[index]) {
 			return false;
 		}
 	}
@@ -103,13 +114,14 @@ bool Queue::open(const std::wstring &session)
 		return false;
 	}
 	const uint32_t width = header->width, height = header->height, slots = header->slots;
-	const Rate rate{header->fps_num, header->fps_den};
+	const Rate rate{header->fps_num, header->fps_den, header->fixed_interval != 0};
 	const uint32_t format = header->pixel_format;
 	const uint32_t target_frames = header->target_frames;
 	const bool valid = header->version == protocol && width && height && width <= 8192 && height <= 8192 &&
 			   !(width & 1) && !(height & 1) && slots && slots <= max_slots && target_frames &&
-			   target_frames <= slots && rate.valid() && valid_pixel_format(format) &&
-			   load(header->active) && process_alive(header->owner_pid, header->owner_start);
+			   target_frames <= slots && rate.valid() && header->fixed_interval <= 1 &&
+			   valid_pixel_format(format) && load(header->active) &&
+			   process_alive(header->owner_pid, header->owner_start);
 	UnmapViewOfFile(header);
 	if (!valid) {
 		return false;
@@ -122,7 +134,8 @@ bool Queue::open(const std::wstring &session)
 	shared = static_cast<Shared *>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size_t(bytes)));
 	if (!shared || shared->width != width || shared->height != height || shared->slots != slots ||
 	    shared->fps_num != rate.numerator || shared->fps_den != rate.denominator ||
-	    shared->pixel_format != format || shared->target_frames != target_frames) {
+	    shared->fixed_interval != uint32_t(rate.fixed_interval) || shared->pixel_format != format ||
+	    shared->target_frames != target_frames) {
 		return false;
 	}
 	pixels = reinterpret_cast<uint8_t *>(shared + 1);
@@ -132,6 +145,16 @@ bool Queue::open(const std::wstring &session)
 			OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE,
 				   object_name(session, (L"slot" + std::to_wstring(index)).c_str()).c_str()));
 		if (!locks[index]) {
+			return false;
+		}
+	}
+	for (size_t index = 0; index < max_clients; ++index) {
+		reader_locks[index].reset(
+			OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE,
+				   object_name(session, (L"reader" + std::to_wstring(index)).c_str()).c_str()));
+		notifications[index].reset(OpenEventW(
+			SYNCHRONIZE, FALSE, object_name(session, (L"frame" + std::to_wstring(index)).c_str()).c_str()));
+		if (!reader_locks[index] || !notifications[index]) {
 			return false;
 		}
 	}
@@ -179,6 +202,11 @@ bool Queue::write_planes(const uint8_t *const *data, const uint32_t *strides, ui
 		InterlockedIncrement64(&shared->dropped);
 		return false;
 	}
+	if (readers_busy(slot)) {
+		ReleaseMutex(locks[slot]);
+		InterlockedIncrement64(&shared->dropped);
+		return false;
+	}
 	store(shared->frames[slot].sequence, 0);
 	auto *output = pixels + slot * frame_bytes;
 	for (uint32_t row = 0; row < shared->height; ++row) {
@@ -210,6 +238,9 @@ bool Queue::write_planes(const uint8_t *const *data, const uint32_t *strides, ui
 	next_sequence = sequence;
 	last_timestamp = timestamp;
 	store(shared->published, sequence);
+	for (auto &notification : notifications) {
+		SetEvent(notification);
+	}
 	return true;
 }
 
@@ -229,12 +260,36 @@ size_t Queue::snapshot(std::array<FrameStamp, max_slots> &frames, uint64_t lates
 	return count;
 }
 
+bool Queue::readers_busy(uint32_t slot)
+{
+	for (size_t index = 0; index < max_clients; ++index) {
+		if (load(shared->reader_slots[index]) != uint64_t(slot) + 1) {
+			continue;
+		}
+		const DWORD result = WaitForSingleObject(reader_locks[index], 0);
+		if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) {
+			store(shared->reader_slots[index], 0);
+			ReleaseMutex(reader_locks[index]);
+		} else if (load(shared->reader_slots[index]) == uint64_t(slot) + 1) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool Queue::copy_frame(const FrameStamp &frame, std::vector<uint8_t> &image)
 {
 	const uint32_t slot = uint32_t((frame.sequence - 1) % shared->slots);
-	const DWORD result = WaitForSingleObject(locks[slot], 0);
+	DWORD result = WaitForSingleObject(locks[slot], 0);
 	if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
-		return false;
+		++read_contention_count;
+		const Rate rate{shared->fps_num, shared->fps_den, shared->fixed_interval != 0};
+		const DWORD timeout = DWORD(std::clamp<uint64_t>((rate.offset(1) + 3999999) / 4000000, 1, 5));
+		result = WaitForSingleObject(locks[slot], timeout);
+		if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
+			++read_timeout_count;
+			return false;
+		}
 	}
 	const auto &record = shared->frames[slot];
 	if (load(record.sequence) != frame.sequence || load(record.timestamp) != frame.timestamp ||
@@ -242,9 +297,23 @@ bool Queue::copy_frame(const FrameStamp &frame, std::vector<uint8_t> &image)
 		ReleaseMutex(locks[slot]);
 		return false;
 	}
-	memcpy(image.data(), pixels + slot * frame_bytes, frame_bytes);
+	for (size_t offset = 0; offset < max_clients; ++offset) {
+		const size_t reader = (next_reader + offset) % max_clients;
+		result = WaitForSingleObject(reader_locks[reader], 0);
+		if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
+			continue;
+		}
+		next_reader = reader;
+		store(shared->reader_slots[reader], uint64_t(slot) + 1);
+		ReleaseMutex(locks[slot]);
+		memcpy(image.data(), pixels + slot * frame_bytes, frame_bytes);
+		store(shared->reader_slots[reader], 0);
+		ReleaseMutex(reader_locks[reader]);
+		return true;
+	}
 	ReleaseMutex(locks[slot]);
-	return true;
+	++read_timeout_count;
+	return false;
 }
 
 bool Queue::select(FrameBuffer &buffer, uint64_t timestamp, std::vector<uint8_t> &image)
@@ -261,8 +330,8 @@ bool Queue::select(FrameBuffer &buffer, uint64_t timestamp, std::vector<uint8_t>
 		return false;
 	}
 	const FrameStamp selected = buffer.select(frames.data(), count, latest, generation, start, timestamp,
-						  {shared->fps_num, shared->fps_den}, shared->target_frames,
-						  shared->slots);
+						  {shared->fps_num, shared->fps_den, shared->fixed_interval != 0},
+						  shared->target_frames, shared->slots);
 	if (!selected.sequence) {
 		return false;
 	}
@@ -274,12 +343,38 @@ bool Queue::select(FrameBuffer &buffer, uint64_t timestamp, std::vector<uint8_t>
 	return true;
 }
 
+bool Queue::next(uint64_t &cursor, FrameStamp &frame, uint64_t &generation_start, std::vector<uint8_t> &image)
+{
+	if (!shared || !load(shared->active)) {
+		return false;
+	}
+	const uint64_t generation = load(shared->generation);
+	const uint64_t start = load(shared->generation_start);
+	const uint64_t latest = load(shared->published);
+	std::array<FrameStamp, max_slots> frames;
+	const size_t count = snapshot(frames, latest, generation);
+	image.resize(frame_bytes);
+	for (size_t index = 0; index < count; ++index) {
+		if (frames[index].sequence <= cursor || !copy_frame(frames[index], image)) {
+			continue;
+		}
+		if (generation != load(shared->generation) || start != load(shared->generation_start)) {
+			return false;
+		}
+		cursor = frames[index].sequence;
+		frame = frames[index];
+		generation_start = start;
+		return true;
+	}
+	return false;
+}
+
 bool Queue::read(uint64_t &consumed, uint64_t now, std::vector<uint8_t> &image, uint64_t &skipped, uint64_t *timestamp)
 {
 	if (!shared || !load(shared->active)) {
 		return false;
 	}
-	const Rate rate{shared->fps_num, shared->fps_den};
+	const Rate rate{shared->fps_num, shared->fps_den, shared->fixed_interval != 0};
 	image.resize(frame_bytes);
 	std::array<FrameStamp, max_slots> frames;
 	const size_t count = snapshot(frames, load(shared->published), load(shared->generation));

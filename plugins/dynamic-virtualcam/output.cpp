@@ -39,6 +39,8 @@ static void *create_output(obs_data_t *settings, obs_output_t *output)
 				uint32_t(obs_data_get_int(settings, "fps_den"))};
 		result->follow_obs_fps = !obs_data_has_user_value(settings, "follow_obs_fps") ||
 					 obs_data_get_bool(settings, "follow_obs_fps");
+		result->use_obs_interval = obs_data_get_bool(settings, "use_obs_interval");
+		result->follow_obs_fps |= result->use_obs_interval;
 		const uint32_t format = obs_data_has_user_value(settings, "pixel_format")
 						? uint32_t(obs_data_get_int(settings, "pixel_format"))
 						: uint32_t(PixelFormat::NV12);
@@ -74,6 +76,7 @@ static bool start_output(void *data)
 	if (context.follow_obs_fps) {
 		context.rate = context.producer_rate;
 	}
+	context.rate.fixed_interval = context.use_obs_interval;
 	context.card.reset();
 	context.card_sequence = 0;
 	context.card_failed = false;
@@ -102,9 +105,11 @@ static bool start_output(void *data)
 		context.queue.reset();
 		return false;
 	}
-	blog(LOG_INFO, "[dynamic-virtualcam] Started %ux%u, %u/%u FPS, target=%u max=%u, format=%u, follow_obs_fps=%d",
+	blog(LOG_INFO,
+	     "[dynamic-virtualcam] Started %ux%u, %u/%u FPS, target=%u max=%u, format=%u, follow_obs_fps=%d use_obs_interval=%d interval_ns=%llu",
 	     width, height, context.rate.numerator, context.rate.denominator, context.target_frames, context.slots,
-	     uint32_t(context.pixel_format), context.follow_obs_fps);
+	     uint32_t(context.pixel_format), context.follow_obs_fps, context.use_obs_interval,
+	     static_cast<unsigned long long>(context.rate.offset(1)));
 	return true;
 }
 

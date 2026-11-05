@@ -14,6 +14,7 @@ struct Output {
 	std::wstring session;
 	Rate rate;
 	bool follow_obs_fps = true;
+	bool use_obs_interval = false;
 	PixelFormat pixel_format = PixelFormat::NV12;
 	uint32_t slots;
 	uint32_t target_frames = 2;

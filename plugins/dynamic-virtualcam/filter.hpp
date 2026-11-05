@@ -2,6 +2,8 @@
 
 #include "ipc.hpp"
 #include "pixels.hpp"
+#include "frame-cache.hpp"
+#include <memory>
 #include <dshow.h>
 #include <ks.h>
 #include <ksmedia.h>
@@ -39,6 +41,8 @@ class Camera final : public IBaseFilter,
 	uint64_t token = 0;
 	Handle stop_event;
 	std::thread worker;
+	std::thread collector;
+	std::unique_ptr<FrameCache> received_frames;
 	std::atomic<REFERENCE_TIME> run_start{0};
 	uint32_t width = 1920, height = 1080;
 	Rate rate;
@@ -49,6 +53,8 @@ class Camera final : public IBaseFilter,
 	HRESULT make_media(int index, AM_MEDIA_TYPE *output) const;
 	HRESULT validate(const AM_MEDIA_TYPE *value, PixelFormat &pixel_format, bool &flipped) const;
 	void deliver();
+	void collect();
+	void update_cache_statistics();
 
 public:
 	explicit Camera(const std::wstring &session = active_session(), REFCLSID id = camera_clsid);

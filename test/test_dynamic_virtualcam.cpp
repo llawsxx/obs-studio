@@ -12,7 +12,9 @@
 void test_camera();
 void test_camera_cadence();
 void test_camera_phase_updates();
+void test_camera_parallel_receivers();
 void test_frame_buffer();
+int frame_buffer_reader_helper(const char *session);
 
 static void test_timing()
 {
@@ -25,11 +27,19 @@ static void test_timing()
 	CHECK((dvc::Rate{999983, 999979}.offset(987654321)) == 987650370315554364ULL);
 	CHECK((dvc::Rate{999983, 999979}.after(1234567890123456)) == 1234573);
 	CHECK((dvc::Rate{60, 1}.window()) == 10000000);
+	const dvc::Rate fixed60{60, 1, true}, fixed_fractional{60000, 1001, true};
+	CHECK(fixed60.offset(1) == 16666666);
+	CHECK(fixed60.offset(3) == 49999998);
+	CHECK(fixed60.offset(60) == 999999960);
+	CHECK(fixed60.offset(3600000) == 59999997600000ULL);
+	CHECK(fixed_fractional.offset(3) == 50049999);
+	CHECK(fixed_fractional.offset(60000) == 1000999980000ULL);
+	CHECK(fixed60.window() == 9999999);
 	CHECK(!(dvc::Rate{0, 1}.valid()));
 	CHECK(!(dvc::Rate{1001, 1}.valid()));
 	CHECK(!(dvc::Rate{1, 2}.valid()));
-	for (const dvc::Rate rate :
-	     {dvc::Rate{60, 1}, fractional, dvc::Rate{999983, 999979}, dvc::Rate{1000000, 1000}}) {
+	for (const dvc::Rate rate : {dvc::Rate{60, 1}, fractional, fixed60, fixed_fractional, dvc::Rate{999983, 999979},
+				     dvc::Rate{1000000, 1000}}) {
 		CHECK(rate.valid());
 		for (uint64_t index = 0; index < 100000; ++index) {
 			const uint64_t deadline = rate.offset(index);
@@ -240,10 +250,17 @@ static void test_card(const char *image_prefix)
 
 int main(int count, char **arguments)
 {
+	if (count == 3 && strcmp(arguments[1], "--reader-crash-helper") == 0) {
+		return frame_buffer_reader_helper(arguments[2]);
+	}
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 	if (count == 2 && strcmp(arguments[1], "--buffer-only") == 0) {
 		test_frame_buffer();
+		return 0;
+	}
+	if (count == 2 && strcmp(arguments[1], "--parallel-receivers-only") == 0) {
+		test_camera_parallel_receivers();
 		return 0;
 	}
 	if (count == 2 && strcmp(arguments[1], "--phase-updates-only") == 0) {
@@ -254,6 +271,9 @@ int main(int count, char **arguments)
 		test_camera_cadence();
 		return 0;
 	}
+	if (count != 1 && !(count == 3 && strcmp(arguments[1], "--test-card-images") == 0)) {
+		return 2;
+	}
 	test_timing();
 	test_frame_buffer();
 	test_pixels();
@@ -261,6 +281,7 @@ int main(int count, char **arguments)
 	test_queue_formats();
 	test_camera();
 	test_camera_cadence();
+	test_camera_parallel_receivers();
 	test_camera_phase_updates();
 	test_card(count == 3 && strcmp(arguments[1], "--test-card-images") == 0 ? arguments[2] : nullptr);
 	puts("dynamic virtual camera timing, selection, conversion, IPC and test card tests passed");

@@ -44,6 +44,52 @@ public:
 	}
 };
 
+void Camera::update_cache_statistics()
+{
+	const auto statistics = received_frames->statistics();
+	auto &client = queue.header()->clients[client_index];
+	store(client.buffered, statistics.buffered);
+	store_max(client.rebuffers, statistics.rebuffers);
+	store_max(client.expired, statistics.discarded);
+	store_max(client.skipped, statistics.discarded);
+}
+
+void Camera::collect()
+{
+	auto *header = queue.header();
+	auto &client = header->clients[client_index];
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+	uint64_t cursor = 0;
+	std::vector<uint8_t> image;
+	HANDLE events[] = {stop_event, queue.frame_event(client_index)};
+	while (WaitForSingleObject(stop_event, 0) == WAIT_TIMEOUT && load(header->active) &&
+	       process_alive(header->owner_pid, header->owner_start)) {
+		FrameStamp frame;
+		uint64_t generation_start = 0;
+		for (;;) {
+			const uint64_t previous = cursor;
+			if (WaitForSingleObject(stop_event, 0) != WAIT_TIMEOUT ||
+			    !queue.next(cursor, frame, generation_start, image)) {
+				break;
+			}
+			if (previous && frame.sequence > previous + 1) {
+				InterlockedAdd64(&client.capture_skipped, LONG64(frame.sequence - previous - 1));
+			}
+			received_frames->push(frame, generation_start, image);
+			InterlockedIncrement64(&client.captured);
+			update_cache_statistics();
+		}
+		store(client.read_contentions, queue.read_contentions());
+		store(client.read_timeouts, queue.read_timeouts());
+		const DWORD timeout = load(header->published) > cursor ? 1 : 100;
+		const DWORD result = WaitForMultipleObjects(2, events, FALSE, timeout);
+		if (result != WAIT_OBJECT_0 + 1 && result != WAIT_TIMEOUT) {
+			break;
+		}
+	}
+	SetEvent(stop_event);
+}
+
 void Camera::deliver()
 {
 	auto *header = queue.header();
@@ -56,11 +102,10 @@ void Camera::deliver()
 	std::vector<uint8_t> black(size_t(width) * height * 4, 0);
 	std::vector<uint8_t> converted(image_size(format, width, height));
 	std::vector<uint8_t> candidate(converted.size());
-	FrameBuffer buffer;
 	uint64_t last_phase = UINT64_MAX;
 	uint64_t deadline = 0, wake_index = 0;
 	uint64_t allocation_ns = std::min<uint64_t>(1000000, rate.offset(1) / 2);
-	uint64_t sample_index = 0, last_rebuffers = 0;
+	uint64_t sample_index = 0, presentation_index = 0, last_rebuffers = 0;
 	REFERENCE_TIME stream_origin = 0;
 	bool started = false;
 	convert(black.data(), converted.data(), format, width, height, false);
@@ -107,11 +152,9 @@ void Camera::deliver()
 		}
 		const uint64_t logical_timestamp = rate.offset(sample_index);
 		const uint64_t select_start = now_ns();
-		const bool fresh = queue.select(buffer, logical_timestamp, candidate);
-		store(client.buffered, buffer.buffered);
-		store(client.rebuffers, buffer.rebuffers);
-		store(client.expired, buffer.discarded);
-		store(client.skipped, buffer.discarded);
+		const bool fresh = received_frames->select(logical_timestamp, candidate);
+		const uint64_t rebuffers = received_frames->statistics().rebuffers;
+		update_cache_statistics();
 		if (!fresh && !started) {
 			advance_wait();
 			continue;
@@ -119,28 +162,44 @@ void Camera::deliver()
 		copy_image(fresh ? candidate.data() : converted.data(), destination, format, width, height, bottom_up);
 		store(client.prepare_ns, now_ns() - select_start);
 		sample->SetActualDataLength(LONG(converted.size()));
-		if (!started) {
-			ComPtr<IReferenceClock> reference;
-			REFERENCE_TIME reference_now = 0;
-			GetSyncSource(&reference);
-			if (reference && SUCCEEDED(reference->GetTime(&reference_now))) {
-				stream_origin = std::max<REFERENCE_TIME>(0, reference_now - run_start.load());
+		ComPtr<IReferenceClock> reference;
+		REFERENCE_TIME reference_now = 0;
+		GetSyncSource(&reference);
+		const bool reference_valid = reference && SUCCEEDED(reference->GetTime(&reference_now));
+		const REFERENCE_TIME stream_now = std::max<REFERENCE_TIME>(0, reference_now - run_start.load());
+		bool timestamp_discontinuity = false;
+		if (reference_valid) {
+			if (!started) {
+				stream_origin = stream_now;
+			} else if (stream_now > stream_origin) {
+				const uint64_t index = rate.index_at(uint64_t(stream_now - stream_origin) * 100);
+				if (index > presentation_index) {
+					InterlockedAdd64(&client.pts_skipped, LONG64(index - presentation_index));
+					presentation_index = index;
+					timestamp_discontinuity = true;
+				}
 			}
 		}
-		REFERENCE_TIME timestamp = stream_origin + REFERENCE_TIME(logical_timestamp / 100);
-		REFERENCE_TIME end = stream_origin + REFERENCE_TIME(rate.offset(sample_index + 1) / 100);
+		REFERENCE_TIME timestamp = stream_origin + REFERENCE_TIME(rate.offset(presentation_index) / 100);
+		REFERENCE_TIME end = stream_origin + REFERENCE_TIME(rate.offset(presentation_index + 1) / 100);
+		store(client.pts_late_ns,
+		      reference_valid && stream_now > timestamp ? uint64_t(stream_now - timestamp) * 100 : 0);
 		sample->SetTime(&timestamp, &end);
 		LONGLONG frame_index = LONGLONG(sample_index), frame_end = frame_index + 1;
 		sample->SetMediaTime(&frame_index, &frame_end);
 		sample->SetSyncPoint(TRUE);
 		sample->SetPreroll(FALSE);
-		sample->SetDiscontinuity(!started || buffer.rebuffers != last_rebuffers);
+		sample->SetDiscontinuity(!started || timestamp_discontinuity || rebuffers != last_rebuffers);
 		const uint64_t delivery_time = now_ns();
 		store(client.late_ns, delivery_time > deadline ? delivery_time - deadline : 0);
 		store(client.heartbeat, delivery_time);
 		const uint64_t receive_start = now_ns();
+		store(client.receive_start_ns, receive_start);
 		result = receiver->Receive(sample.Get());
-		store(client.receive_ns, now_ns() - receive_start);
+		const uint64_t receive_duration = now_ns() - receive_start;
+		store(client.receive_ns, receive_duration);
+		store(client.max_receive_ns, std::max(load(client.max_receive_ns), receive_duration));
+		store(client.receive_start_ns, 0);
 		store(client.last_result, uint32_t(result));
 		if (result != S_OK) {
 			break;
@@ -149,8 +208,9 @@ void Camera::deliver()
 			converted.swap(candidate);
 		}
 		started = true;
-		last_rebuffers = buffer.rebuffers;
+		last_rebuffers = rebuffers;
 		++sample_index;
+		++presentation_index;
 		InterlockedIncrement64(&client.delivered);
 		InterlockedIncrement64(&header->delivered);
 		if (!fresh) {
@@ -159,6 +219,7 @@ void Camera::deliver()
 		}
 		advance_wait();
 	}
+	SetEvent(stop_event);
 	store(client.streaming, 0);
 }
 

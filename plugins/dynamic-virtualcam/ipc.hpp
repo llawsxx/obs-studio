@@ -19,7 +19,7 @@ inline constexpr wchar_t camera_name[] = L"OBS Dynamic Virtual Camera";
 inline constexpr wchar_t registry_root[] = L"Software\\Classes\\CLSID\\{D02ABF12-4D12-4876-8B4C-B9DE7C623FF1}";
 inline constexpr uint32_t protocol = 1;
 inline constexpr size_t max_clients = 32;
-inline constexpr size_t max_slots = 30;
+inline constexpr size_t max_slots = max_buffer_frames;
 
 class Handle {
 	HANDLE value = nullptr;
@@ -65,6 +65,14 @@ struct alignas(8) Client {
 	alignas(8) LONG64 pixel_format;
 	alignas(8) LONG64 buffered;
 	alignas(8) LONG64 rebuffers;
+	alignas(8) LONG64 read_contentions;
+	alignas(8) LONG64 read_timeouts;
+	alignas(8) LONG64 pts_skipped;
+	alignas(8) LONG64 pts_late_ns;
+	alignas(8) LONG64 receive_start_ns;
+	alignas(8) LONG64 max_receive_ns;
+	alignas(8) LONG64 captured;
+	alignas(8) LONG64 capture_skipped;
 };
 
 struct alignas(8) Shared {
@@ -78,7 +86,7 @@ struct alignas(8) Shared {
 	uint32_t pixel_format;
 	uint64_t owner_start;
 	uint32_t target_frames;
-	uint32_t reserved;
+	uint32_t fixed_interval;
 	alignas(8) LONG64 active;
 	alignas(8) LONG64 wake_epoch;
 	alignas(8) LONG64 generation;
@@ -89,12 +97,14 @@ struct alignas(8) Shared {
 	alignas(8) LONG64 delivered;
 	alignas(8) LONG64 repeated;
 	Slot frames[max_slots];
+	alignas(8) LONG64 reader_slots[max_clients];
 	Client clients[max_clients];
 };
 
 static_assert(sizeof(Slot) == 24);
-static_assert(sizeof(Client) == 128);
-static_assert(sizeof(Shared) == 120 + sizeof(Slot) * max_slots + sizeof(Client) * max_clients);
+static_assert(sizeof(Client) == 192);
+static_assert(sizeof(Shared) ==
+	      120 + sizeof(Slot) * max_slots + sizeof(LONG64) * max_clients + sizeof(Client) * max_clients);
 
 inline uint64_t load(const LONG64 &value)
 {
@@ -104,6 +114,19 @@ inline uint64_t load(const LONG64 &value)
 inline void store(LONG64 &value, uint64_t number)
 {
 	InterlockedExchange64(&value, LONG64(number));
+}
+
+inline void store_max(LONG64 &value, uint64_t number)
+{
+	uint64_t previous = load(value);
+	while (number > previous) {
+		const uint64_t observed =
+			uint64_t(InterlockedCompareExchange64(&value, LONG64(number), LONG64(previous)));
+		if (observed == previous) {
+			break;
+		}
+		previous = observed;
+	}
 }
 
 uint64_t now_ns();
@@ -123,14 +146,20 @@ class Queue {
 	Handle mapping;
 	Handle control;
 	std::array<Handle, max_slots> locks;
+	std::array<Handle, max_clients> reader_locks;
+	std::array<Handle, max_clients> notifications;
+	size_t next_reader = 0;
 	Shared *shared = nullptr;
 	uint8_t *pixels = nullptr;
 	size_t frame_bytes = 0;
 	uint64_t next_sequence = 0;
 	uint64_t last_timestamp = 0;
+	uint64_t read_contention_count = 0;
+	uint64_t read_timeout_count = 0;
 	std::wstring session_name;
 	size_t snapshot(std::array<FrameStamp, max_slots> &frames, uint64_t latest, uint64_t generation) const;
 	bool copy_frame(const FrameStamp &frame, std::vector<uint8_t> &image);
+	bool readers_busy(uint32_t slot);
 
 public:
 	~Queue();
@@ -141,6 +170,12 @@ public:
 		    PixelFormat format = PixelFormat::ARGB32, uint32_t target_frames = 2);
 	bool open(const std::wstring &session);
 	Shared *header() const { return shared; }
+	uint64_t read_contentions() const { return read_contention_count; }
+	uint64_t read_timeouts() const { return read_timeout_count; }
+	HANDLE frame_event(int client) const
+	{
+		return client >= 0 && client < int(max_clients) ? HANDLE(notifications[client]) : nullptr;
+	}
 	bool lock_control(DWORD timeout = 100) const;
 	void unlock_control() const;
 	bool write(const uint8_t *data, size_t stride, uint64_t timestamp);
@@ -148,6 +183,7 @@ public:
 	bool read(uint64_t &consumed, uint64_t now, std::vector<uint8_t> &image, uint64_t &skipped,
 		  uint64_t *timestamp = nullptr);
 	bool select(FrameBuffer &buffer, uint64_t timestamp, std::vector<uint8_t> &image);
+	bool next(uint64_t &cursor, FrameStamp &frame, uint64_t &generation_start, std::vector<uint8_t> &image);
 	int attach(uint64_t token);
 	void detach(int index, uint64_t token);
 };

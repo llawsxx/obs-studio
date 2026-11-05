@@ -23,6 +23,7 @@ class Sink final : public IPin, public IMemInputPin {
 	REFERENCE_TIME first_timestamp = -1;
 	LONGLONG previous_media = -1;
 	bool check_media;
+	uint64_t previous_pts_index = 0;
 
 public:
 	std::atomic<uint64_t> received{0};
@@ -33,6 +34,12 @@ public:
 	size_t row_stride = 0;
 	uint32_t rows = 0;
 	std::atomic<uint64_t> oriented{0};
+	ComPtr<IReferenceClock> timing_clock;
+	REFERENCE_TIME graph_start = 0;
+	std::atomic<uint64_t> maximum_pts_late{0};
+	std::atomic<DWORD> stall_ms{0};
+	std::atomic<bool> inside_receive{false};
+	std::atomic<uint64_t> stalls{0};
 	explicit Sink(LONG size, dvc::Rate rate = {60000, 1001}, bool check_media = false)
 		: expected(size),
 		  rate(rate),
@@ -138,7 +145,13 @@ public:
 			if (first_timestamp < 0) {
 				first_timestamp = start;
 			}
-			CHECK(start - first_timestamp == REFERENCE_TIME(rate.offset(uint64_t(media_start)) / 100));
+			const uint64_t pts_index = rate.index_at((uint64_t(start - first_timestamp) + 1) * 100);
+			CHECK(start - first_timestamp == REFERENCE_TIME(rate.offset(pts_index) / 100));
+			CHECK(pts_index >= uint64_t(media_start));
+			if (media_start && pts_index > previous_pts_index + 1) {
+				CHECK(sample->IsDiscontinuity() == S_OK);
+			}
+			previous_pts_index = pts_index;
 			previous_media = media_start;
 		}
 		BYTE *data = nullptr;
@@ -159,7 +172,21 @@ public:
 		if (!first_receive) {
 			first_receive = last_receive;
 		}
-		++received;
+		if (timing_clock) {
+			REFERENCE_TIME current = 0;
+			CHECK(SUCCEEDED(timing_clock->GetTime(&current)));
+			const uint64_t late =
+				current > graph_start + start ? uint64_t(current - graph_start - start) * 100 : 0;
+			maximum_pts_late = std::max(maximum_pts_late.load(), late);
+		}
+		const uint64_t delivered = ++received;
+		const DWORD delay = stall_ms.load();
+		if (delay && !(delivered % 20) && stalls < 3) {
+			++stalls;
+			inside_receive = true;
+			Sleep(delay);
+			inside_receive = false;
+		}
 		return S_OK;
 	}
 	STDMETHODIMP ReceiveMultiple(IMediaSample **samples, LONG count, LONG *processed) override
@@ -418,10 +445,124 @@ void test_camera_cadence()
 	CoUninitialize();
 }
 
+void test_camera_parallel_receivers()
+{
+	CHECK(SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)));
+	for (const dvc::Rate rate :
+	     {dvc::Rate{60, 1}, dvc::Rate{60000, 1001}, dvc::Rate{60, 1, true}, dvc::Rate{60000, 1001, true}}) {
+		printf("test_camera_parallel_receivers fixed_interval=%d\n", rate.fixed_interval);
+		for (const size_t clients : {size_t(1), size_t(2)}) {
+			const std::wstring session = new_session();
+			const uint32_t width = 1080, height = 1920;
+			dvc::Queue writer;
+			CHECK(writer.create(session, width, height, 4, rate, dvc::PixelFormat::NV12));
+			std::atomic<bool> running{true};
+			std::thread producer([&] {
+				std::vector<uint8_t> pixels(dvc::image_size(dvc::PixelFormat::NV12, width, height));
+				dvc::Handle timer(CreateWaitableTimerExW(nullptr, nullptr, 2, TIMER_ALL_ACCESS));
+				CHECK(timer);
+				const uint64_t epoch = dvc::now_ns() + 50000000;
+				for (uint64_t index = 0; running; ++index) {
+					const uint64_t target = epoch + rate.offset(index);
+					while (running && dvc::now_ns() < target) {
+						const uint64_t current = dvc::now_ns();
+						if (current >= target) {
+							break;
+						}
+						LARGE_INTEGER due;
+						due.QuadPart = -LONGLONG((target - current + 99) / 100);
+						CHECK(SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE));
+						CHECK(WaitForSingleObject(timer, 1000) == WAIT_OBJECT_0);
+					}
+					if (running) {
+						memset(pixels.data(), uint8_t(index + 1), pixels.size());
+						writer.write(pixels.data(), width,
+							     500000000000ULL + rate.offset(index));
+					}
+				}
+			});
+			ComPtr<IReferenceClock> clock;
+			CHECK(SUCCEEDED(CoCreateInstance(CLSID_SystemClock, nullptr, CLSCTX_INPROC_SERVER,
+							 IID_PPV_ARGS(&clock))));
+			REFERENCE_TIME graph_start = 0;
+			CHECK(SUCCEEDED(clock->GetTime(&graph_start)));
+			std::array<ComPtr<dvc::Camera>, 2> cameras;
+			std::array<ComPtr<Sink>, 2> sinks;
+			for (size_t index = 0; index < clients; ++index) {
+				cameras[index].Attach(new dvc::Camera(session));
+				AM_MEDIA_TYPE *media = nullptr;
+				VIDEO_STREAM_CONFIG_CAPS caps;
+				CHECK(SUCCEEDED(
+					cameras[index]->GetStreamCaps(0, &media, reinterpret_cast<BYTE *>(&caps))));
+				sinks[index].Attach(new Sink(LONG(media->lSampleSize), rate, true));
+				sinks[index]->timing_clock = clock;
+				sinks[index]->graph_start = graph_start;
+				CHECK(SUCCEEDED(cameras[index]->Connect(sinks[index].Get(), media)));
+				dvc::free_media(*media);
+				CoTaskMemFree(media);
+				CHECK(SUCCEEDED(cameras[index]->SetSyncSource(clock.Get())));
+				CHECK(SUCCEEDED(cameras[index]->Run(graph_start)));
+			}
+			for (size_t index = 0; index < clients; ++index) {
+				wait_frames(sinks[index].Get(), 120);
+				printf("%u/%u FPS, %zu clients, receiver %zu: %llu/%llu distinct before stalls\n",
+				       rate.numerator, rate.denominator, clients, index,
+				       static_cast<unsigned long long>(sinks[index]->distinct.load()),
+				       static_cast<unsigned long long>(sinks[index]->received.load()));
+				CHECK(sinks[index]->distinct * 100 >= sinks[index]->received * 93);
+			}
+			Sink *slow = sinks[clients - 1].Get();
+			slow->stall_ms = 200;
+			const uint64_t stall_deadline = dvc::now_ns() + 2000000000;
+			while (!slow->inside_receive && dvc::now_ns() < stall_deadline) {
+				Sleep(1);
+			}
+			CHECK(slow->inside_receive);
+			auto &slow_client = writer.header()->clients[clients - 1];
+			const uint64_t captured = dvc::load(slow_client.captured);
+			Sleep(80);
+			CHECK(slow->inside_receive && dvc::load(slow_client.captured) >= captured + 2);
+			CHECK(dvc::load(slow_client.buffered) <= writer.header()->slots);
+			wait_frames(slow, slow->received + 85);
+			for (size_t index = 0; index < clients; ++index) {
+				CHECK(SUCCEEDED(cameras[index]->Stop()));
+			}
+			running = false;
+			producer.join();
+			CHECK(slow->stalls == 3);
+			uint64_t skipped = 0, maximum_receive = 0;
+			for (const auto &client : writer.header()->clients) {
+				if (!client.pid) {
+					continue;
+				}
+				skipped += dvc::load(client.pts_skipped);
+				maximum_receive = std::max(maximum_receive, dvc::load(client.max_receive_ns));
+				CHECK(!dvc::load(client.read_timeouts));
+			}
+			CHECK(skipped >= 25 && maximum_receive >= 190000000);
+			for (size_t index = 0; index < clients; ++index) {
+				printf("Receiver %zu after three 200ms stalls: max PTS lateness %.3fms, %llu timestamp slots skipped\n",
+				       index, double(sinks[index]->maximum_pts_late) / 1000000.0,
+				       static_cast<unsigned long long>(skipped));
+				CHECK(sinks[index]->maximum_pts_late < rate.offset(2) + 5000000);
+				if (index + 1 < clients) {
+					CHECK(sinks[index]->distinct * 100 >= sinks[index]->received * 93);
+				}
+				CHECK(SUCCEEDED(cameras[index]->Disconnect()));
+				CHECK(SUCCEEDED(sinks[index]->Disconnect()));
+			}
+		}
+	}
+	CHECK(dvc::object_count == 0);
+	CoUninitialize();
+}
+
 void test_camera_phase_updates()
 {
 	CHECK(SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)));
-	for (const dvc::Rate rate : {dvc::Rate{60, 1}, dvc::Rate{60000, 1001}}) {
+	for (const dvc::Rate rate :
+	     {dvc::Rate{60, 1}, dvc::Rate{60000, 1001}, dvc::Rate{60, 1, true}, dvc::Rate{60000, 1001, true}}) {
+		printf("test_camera_phase_updates fixed_interval=%d\n", rate.fixed_interval);
 		const std::wstring session = new_session();
 		dvc::Queue writer;
 		CHECK(writer.create(session, 16, 16, 3, rate, dvc::PixelFormat::NV12));

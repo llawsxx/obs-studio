@@ -5,6 +5,8 @@
 
 namespace dvc {
 
+inline constexpr size_t max_buffer_frames = 30;
+
 struct FrameStamp {
 	uint64_t sequence = 0;
 	uint64_t timestamp = 0;
@@ -32,11 +34,11 @@ public:
 	uint64_t buffered = 0;
 	bool playing = false;
 
-	FrameStamp select(const FrameStamp *frames, size_t count, uint64_t latest, uint64_t current_generation,
-			  uint64_t generation_start, uint64_t clock, Rate rate, uint32_t target, uint32_t maximum)
+	bool observe(uint64_t latest, uint64_t current_generation, uint64_t generation_start, uint32_t target,
+		     uint32_t maximum)
 	{
 		if (!current_generation || !generation_start || latest < generation_start) {
-			return {};
+			return false;
 		}
 		if (generation != current_generation) {
 			if (generation) {
@@ -54,6 +56,21 @@ public:
 		buffered = latest > consumed ? latest - consumed : 0;
 		if (!buffered) {
 			playing = false;
+		}
+		return true;
+	}
+
+	void rebuffer(uint64_t sequence, uint64_t latest)
+	{
+		discard_to(sequence);
+		playing = false;
+		buffered = latest > consumed ? latest - consumed : 0;
+	}
+
+	FrameStamp select(const FrameStamp *frames, size_t count, uint64_t latest, uint64_t current_generation,
+			  uint64_t generation_start, uint64_t clock, Rate rate, uint32_t target, uint32_t maximum)
+	{
+		if (!observe(latest, current_generation, generation_start, target, maximum) || !buffered) {
 			return {};
 		}
 		size_t first = 0;

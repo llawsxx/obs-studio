@@ -28,6 +28,7 @@ class DevicePanel final : public QWidget {
 	QLabel *phase_value;
 	QComboBox *pixel_format;
 	QCheckBox *follow_obs_fps;
+	QCheckBox *use_obs_interval;
 	QPushButton *toggle;
 	QLabel *statistics;
 	QLabel *status;
