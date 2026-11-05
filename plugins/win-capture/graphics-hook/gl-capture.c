@@ -599,6 +599,7 @@ static void gl_shtex_capture(void)
 	obsglDXUnlockObjectsNV(data.gl_device, 1, &data.gl_dxobj);
 
 	IDXGISwapChain_Present(data.dxgi_swap, 0, 0);
+	capture_publish_frame(0);
 }
 
 static void gl_shmem_capture_copy(int i)

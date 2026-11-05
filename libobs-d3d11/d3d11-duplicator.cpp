@@ -17,6 +17,7 @@
 
 #include "d3d11-subsystem.hpp"
 #include <unordered_map>
+#include <util/util_uint64.h>
 
 static inline bool get_monitor(gs_device_t *device, int monitor_idx, IDXGIOutput **dxgiOutput)
 {
@@ -253,7 +254,7 @@ static inline void copy_texture(gs_duplicator_t *d, ID3D11Texture2D *tex)
 	}
 }
 
-EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
+static bool update_duplicator_frame(gs_duplicator_t *d, bool poll)
 {
 	DXGI_OUTDUPL_FRAME_INFO info;
 	ComPtr<ID3D11Texture2D> tex;
@@ -263,7 +264,7 @@ EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
 	if (!d->duplicator) {
 		return false;
 	}
-	if (d->updated) {
+	if (d->updated && !poll) {
 		return true;
 	}
 
@@ -293,9 +294,26 @@ EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
 	}
 
 	copy_texture(d, tex);
+	if (info.LastPresentTime.QuadPart) {
+		LARGE_INTEGER frequency;
+		QueryPerformanceFrequency(&frequency);
+		d->frame_timestamp = util_mul_div64(info.LastPresentTime.QuadPart, 1000000000ULL, frequency.QuadPart);
+	}
 	d->duplicator->ReleaseFrame();
 	d->updated = true;
 	return true;
+}
+
+EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
+{
+	return update_duplicator_frame(d, false);
+}
+
+EXPORT bool gs_duplicator_poll_frame(gs_duplicator_t *d, uint64_t *timestamp)
+{
+	const bool success = update_duplicator_frame(d, true);
+	*timestamp = d->frame_timestamp;
+	return success;
 }
 
 EXPORT gs_texture_t *gs_duplicator_get_texture(gs_duplicator_t *duplicator)

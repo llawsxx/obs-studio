@@ -252,6 +252,10 @@ static inline void d3d11_shtex_capture(ID3D11Resource *backbuffer)
 {
 	if (data.texture) {
 		d3d11_copy_texture(data.texture, backbuffer);
+		if (InterlockedCompareExchange(&global_hook_info->frame_buffer_requested, 0, 0)) {
+			data.context->Flush();
+			capture_publish_frame(0);
+		}
 	}
 }
 

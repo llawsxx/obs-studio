@@ -5,6 +5,7 @@
 
 #include "dc-capture.h"
 #include "audio-helpers.h"
+#include "capture-frame-buffer.h"
 #include "compat-helpers.h"
 #ifdef OBS_LEGACY
 #include "../../libobs/util/platform.h"
@@ -47,6 +48,8 @@ typedef BOOL (*PFN_winrt_capture_active)(const struct winrt_capture *capture);
 typedef BOOL (*PFN_winrt_capture_show_cursor)(struct winrt_capture *capture, BOOL visible);
 typedef enum gs_color_space (*PFN_winrt_capture_get_color_space)(const struct winrt_capture *capture);
 typedef void (*PFN_winrt_capture_render)(struct winrt_capture *capture);
+typedef void (*PFN_winrt_capture_set_frame_callback)(struct winrt_capture *, winrt_capture_frame_callback, void *);
+typedef void (*PFN_winrt_capture_render_texture)(struct winrt_capture *, gs_texture_t *);
 typedef uint32_t (*PFN_winrt_capture_width)(const struct winrt_capture *capture);
 typedef uint32_t (*PFN_winrt_capture_height)(const struct winrt_capture *capture);
 
@@ -59,6 +62,8 @@ struct winrt_exports {
 	PFN_winrt_capture_show_cursor winrt_capture_show_cursor;
 	PFN_winrt_capture_get_color_space winrt_capture_get_color_space;
 	PFN_winrt_capture_render winrt_capture_render;
+	PFN_winrt_capture_set_frame_callback winrt_capture_set_frame_callback;
+	PFN_winrt_capture_render_texture winrt_capture_render_texture;
 	PFN_winrt_capture_width winrt_capture_width;
 	PFN_winrt_capture_height winrt_capture_height;
 };
@@ -76,6 +81,8 @@ typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetWindowDpiAwarenessContext)(HWND);
 struct window_capture {
 	obs_source_t *source;
 	obs_source_t *audio_source;
+	struct capture_worker worker;
+	struct capture_frame_buffer frame_buffer;
 
 	pthread_mutex_t update_mutex;
 
@@ -292,6 +299,10 @@ static bool load_winrt_imports(struct winrt_exports *exports, void *module, cons
 	WINRT_IMPORT(winrt_capture_show_cursor);
 	WINRT_IMPORT(winrt_capture_get_color_space);
 	WINRT_IMPORT(winrt_capture_render);
+	exports->winrt_capture_set_frame_callback =
+		(PFN_winrt_capture_set_frame_callback)os_dlsym(module, "winrt_capture_set_frame_callback");
+	exports->winrt_capture_render_texture =
+		(PFN_winrt_capture_render_texture)os_dlsym(module, "winrt_capture_render_texture");
 	WINRT_IMPORT(winrt_capture_width);
 	WINRT_IMPORT(winrt_capture_height);
 
@@ -300,12 +311,20 @@ static bool load_winrt_imports(struct winrt_exports *exports, void *module, cons
 
 extern bool graphics_uses_d3d11;
 
+static void wc_capture_buffered(void *data);
+
 static void *wc_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct window_capture *wc = bzalloc(sizeof(struct window_capture));
 	wc->source = source;
 
 	pthread_mutex_init(&wc->update_mutex, NULL);
+	if (!capture_worker_init(&wc->worker, wc_capture_buffered, wc)) {
+		capture_worker_free(&wc->worker);
+		pthread_mutex_destroy(&wc->update_mutex);
+		bfree(wc);
+		return NULL;
+	}
 
 	if (graphics_uses_d3d11) {
 		static const char *const module = "libobs-winrt";
@@ -344,6 +363,10 @@ static void *wc_create(obs_data_t *settings, obs_source_t *source)
 	signal_handler_connect(sh, "rename", rename_audio_source, &wc->audio_source);
 
 	update_settings(wc, settings);
+	obs_enter_graphics();
+	wc->worker.event_driven = wc->method == METHOD_WGC;
+	capture_frame_buffer_update(&wc->frame_buffer, &wc->worker, settings);
+	obs_leave_graphics();
 	log_settings(wc, settings);
 	return wc;
 }
@@ -358,6 +381,7 @@ static void wc_actual_destroy(void *data)
 
 	obs_enter_graphics();
 	dc_capture_free(&wc->capture);
+	capture_frame_buffer_free(&wc->frame_buffer);
 	obs_leave_graphics();
 
 	bfree(wc->title);
@@ -375,6 +399,7 @@ static void wc_actual_destroy(void *data)
 static void wc_destroy(void *data)
 {
 	struct window_capture *wc = data;
+	capture_worker_free(&wc->worker);
 	if (wc->audio_source)
 		destroy_audio_source(wc->source, &wc->audio_source);
 
@@ -397,15 +422,39 @@ static void force_reset(struct window_capture *wc)
 static void wc_update(void *data, obs_data_t *settings)
 {
 	struct window_capture *wc = data;
+	pthread_mutex_lock(&wc->worker.mutex);
 	update_settings(wc, settings);
+	obs_enter_graphics();
+	if (wc->capture_winrt && wc->exports.winrt_capture_set_frame_callback)
+		wc->exports.winrt_capture_set_frame_callback(wc->capture_winrt, NULL, NULL);
+	capture_frame_buffer_clear(&wc->frame_buffer);
+	wc->worker.event_driven = wc->method == METHOD_WGC;
+	capture_frame_buffer_update(&wc->frame_buffer, &wc->worker, settings);
+	obs_leave_graphics();
 	log_settings(wc, settings);
 
 	force_reset(wc);
+	pthread_mutex_unlock(&wc->worker.mutex);
 }
 
 static bool window_normal(struct window_capture *wc)
 {
 	return (IsWindow(wc->window) && !IsIconic(wc->window));
+}
+
+static void wc_capture_buffered(void *data)
+{
+	struct window_capture *wc = data;
+	if (wc->method != METHOD_BITBLT || !obs_source_showing(wc->source) || !window_normal(wc) ||
+	    !wc->capture.valid || !capture_frame_buffer_due(&wc->frame_buffer, os_gettime_ns()))
+		return;
+	DPI_AWARENESS_CONTEXT previous = NULL;
+	if (wc->get_window_dpi_awareness_context)
+		previous = wc->set_thread_dpi_awareness_context(wc->get_window_dpi_awareness_context(wc->window));
+	if (dc_capture_capture(&wc->capture, wc->window))
+		capture_frame_buffer_push(&wc->frame_buffer, wc->capture.texture, os_gettime_ns());
+	if (previous)
+		wc->set_thread_dpi_awareness_context(previous);
 }
 
 static uint32_t wc_width(void *data)
@@ -430,6 +479,7 @@ static uint32_t wc_height(void *data)
 
 static void wc_defaults(obs_data_t *defaults)
 {
+	capture_frame_buffer_defaults(defaults);
 	obs_data_set_default_int(defaults, "method", METHOD_AUTO);
 	obs_data_set_default_bool(defaults, "cursor", true);
 	obs_data_set_default_bool(defaults, "force_sdr", false);
@@ -562,6 +612,7 @@ static obs_properties_t *wc_properties(void *data)
 	obs_properties_add_bool(ppts, "client_area", TEXT_CLIENT_AREA);
 
 	obs_properties_add_bool(ppts, "force_sdr", TEXT_FORCE_SDR);
+	capture_frame_buffer_properties(ppts);
 
 	return ppts;
 }
@@ -569,6 +620,7 @@ static obs_properties_t *wc_properties(void *data)
 static void wc_hide(void *data)
 {
 	struct window_capture *wc = data;
+	pthread_mutex_lock(&wc->worker.mutex);
 
 	if (wc->capture_winrt) {
 		wc->exports.winrt_capture_free(wc->capture_winrt);
@@ -576,6 +628,9 @@ static void wc_hide(void *data)
 	}
 
 	memset(&wc->last_rect, 0, sizeof(wc->last_rect));
+	obs_enter_graphics();
+	capture_frame_buffer_clear(&wc->frame_buffer);
+	obs_leave_graphics();
 
 	if (wc->hooked) {
 		wc->hooked = false;
@@ -586,9 +641,10 @@ static void wc_hide(void *data)
 		signal_handler_signal(sh, "unhooked", &data);
 		calldata_free(&data);
 	}
+	pthread_mutex_unlock(&wc->worker.mutex);
 }
 
-static void wc_tick(void *data, float seconds)
+static void wc_tick_internal(void *data, float seconds)
 {
 	struct window_capture *wc = data;
 	RECT rect;
@@ -703,6 +759,7 @@ static void wc_tick(void *data, float seconds)
 			wc->resize_timer = 0.0f;
 			wc->last_rect = rect;
 			dc_capture_free(&wc->capture);
+			capture_frame_buffer_clear(&wc->frame_buffer);
 			dc_capture_init(&wc->capture, 0, 0, rect.right - rect.left, rect.bottom - rect.top, wc->cursor,
 					wc->compatibility);
 			if (!wc->hooked && wc->capture.valid) {
@@ -731,7 +788,8 @@ static void wc_tick(void *data, float seconds)
 			}
 		}
 
-		dc_capture_capture(&wc->capture, wc->window);
+		if (!wc->frame_buffer.config.enabled)
+			dc_capture_capture(&wc->capture, wc->window);
 
 		if (previous)
 			wc->set_thread_dpi_awareness_context(previous);
@@ -774,6 +832,31 @@ static void wc_tick(void *data, float seconds)
 	obs_leave_graphics();
 }
 
+static void wc_tick(void *data, float seconds)
+{
+	struct window_capture *wc = data;
+	pthread_mutex_lock(&wc->worker.mutex);
+	wc_tick_internal(data, seconds);
+	obs_enter_graphics();
+	if (wc->method == METHOD_WGC && wc->capture_winrt && wc->exports.winrt_capture_set_frame_callback &&
+	    wc->exports.winrt_capture_render_texture)
+		wc->exports.winrt_capture_set_frame_callback(
+			wc->capture_winrt, wc->frame_buffer.config.enabled ? capture_frame_buffer_push : NULL,
+			&wc->frame_buffer);
+	if (wc->method == METHOD_WGC) {
+		InterlockedExchange(&wc->worker.enabled, 0);
+		if (wc->frame_buffer.config.enabled &&
+		    (!wc->exports.winrt_capture_set_frame_callback || !wc->exports.winrt_capture_render_texture)) {
+			blog(LOG_WARNING, "[window-capture] Frame-count buffering requires an updated libobs-winrt.");
+			wc->frame_buffer.config.enabled = false;
+		}
+	}
+	if (obs_source_showing(wc->source))
+		capture_frame_buffer_tick(&wc->frame_buffer, wc->source);
+	obs_leave_graphics();
+	pthread_mutex_unlock(&wc->worker.mutex);
+}
+
 static void wc_render(void *data, gs_effect_t *effect)
 {
 	struct window_capture *wc = data;
@@ -784,14 +867,23 @@ static void wc_render(void *data, gs_effect_t *effect)
 	if (wc->method == METHOD_WGC) {
 		if (wc->capture_winrt) {
 			if (wc->exports.winrt_capture_active(wc->capture_winrt)) {
-				wc->exports.winrt_capture_render(wc->capture_winrt);
+				if (wc->frame_buffer.config.enabled)
+					wc->exports.winrt_capture_render_texture(wc->capture_winrt,
+										 wc->frame_buffer.selected);
+				else
+					wc->exports.winrt_capture_render(wc->capture_winrt);
 			} else {
+				capture_frame_buffer_clear(&wc->frame_buffer);
 				wc->exports.winrt_capture_free(wc->capture_winrt);
 				wc->capture_winrt = NULL;
 			}
 		}
 	} else {
-		dc_capture_render(&wc->capture, obs_source_get_texcoords_centered(wc->source));
+		if (wc->frame_buffer.config.enabled)
+			dc_capture_render_texture(&wc->capture, obs_source_get_texcoords_centered(wc->source),
+						  wc->frame_buffer.selected);
+		else
+			dc_capture_render(&wc->capture, obs_source_get_texcoords_centered(wc->source));
 	}
 
 	UNUSED_PARAMETER(effect);

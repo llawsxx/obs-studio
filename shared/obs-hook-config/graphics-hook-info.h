@@ -90,6 +90,30 @@ struct graphics_offsets {
 	struct d3d12_offsets d3d12;
 };
 
+struct hook_frame_info {
+	volatile LONG serial;
+	volatile uint32_t timestamp_low;
+	volatile uint32_t timestamp_high;
+};
+
+static inline uint64_t hook_frame_timestamp(struct hook_frame_info *frame)
+{
+	const LONG serial = InterlockedCompareExchange(&frame->serial, 0, 0);
+	if (!serial || (serial & 1))
+		return 0;
+	const uint64_t timestamp = ((uint64_t)frame->timestamp_high << 32) | frame->timestamp_low;
+	MemoryBarrier();
+	return InterlockedCompareExchange(&frame->serial, 0, 0) == serial ? timestamp : 0;
+}
+
+static inline void hook_frame_publish(struct hook_frame_info *frame, uint64_t timestamp)
+{
+	InterlockedIncrement(&frame->serial);
+	frame->timestamp_low = (uint32_t)timestamp;
+	frame->timestamp_high = (uint32_t)(timestamp >> 32);
+	InterlockedIncrement(&frame->serial);
+}
+
 struct hook_info {
 	/* hook version */
 	uint32_t hook_ver_major;
@@ -118,7 +142,10 @@ struct hook_info {
 	/* hook addresses */
 	struct graphics_offsets offsets;
 
-	uint32_t reserved[126];
+	uint32_t frame_buffer_version;
+	volatile LONG frame_buffer_requested;
+	struct hook_frame_info frames[3];
+	uint32_t reserved[115];
 };
 static_assert(sizeof(struct hook_info) == 648, "ABI compatibility");
 

@@ -1140,8 +1140,10 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 	debug_res("QueueSubmit", res);
 #endif
 
-	if (res == VK_SUCCESS)
+	if (res == VK_SUCCESS) {
 		frame_data->cmd_buffer_busy = true;
+		capture_publish_frame(0);
+	}
 }
 
 static inline bool valid_rect(struct vk_swap_data *swap)

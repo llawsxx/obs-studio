@@ -237,6 +237,7 @@ struct gs_exports {
 	void (*gs_duplicator_destroy)(gs_duplicator_t *duplicator);
 
 	bool (*gs_duplicator_update_frame)(gs_duplicator_t *duplicator);
+	bool (*gs_duplicator_poll_frame)(gs_duplicator_t *duplicator, uint64_t *timestamp);
 	gs_texture_t *(*gs_duplicator_get_texture)(gs_duplicator_t *duplicator);
 	enum gs_color_space (*gs_duplicator_get_color_space)(gs_duplicator_t *duplicator);
 	float (*gs_duplicator_get_sdr_white_level)(gs_duplicator_t *duplicator);

@@ -5,6 +5,7 @@
 #include <util/threading.h>
 
 #include "cursor-capture.h"
+#include "capture-frame-buffer.h"
 #ifdef OBS_LEGACY
 #include "../../libobs/util/platform.h"
 #include "../../libobs-winrt/winrt-capture.h"
@@ -47,6 +48,8 @@ typedef void (*PFN_winrt_capture_free)(struct winrt_capture *capture);
 typedef BOOL (*PFN_winrt_capture_active)(const struct winrt_capture *capture);
 typedef enum gs_color_space (*PFN_winrt_capture_get_color_space)(const struct winrt_capture *capture);
 typedef void (*PFN_winrt_capture_render)(struct winrt_capture *capture);
+typedef void (*PFN_winrt_capture_set_frame_callback)(struct winrt_capture *, winrt_capture_frame_callback, void *);
+typedef void (*PFN_winrt_capture_render_texture)(struct winrt_capture *, gs_texture_t *);
 typedef uint32_t (*PFN_winrt_capture_width)(const struct winrt_capture *capture);
 typedef uint32_t (*PFN_winrt_capture_height)(const struct winrt_capture *capture);
 
@@ -58,6 +61,8 @@ struct winrt_exports {
 	PFN_winrt_capture_active winrt_capture_active;
 	PFN_winrt_capture_get_color_space winrt_capture_get_color_space;
 	PFN_winrt_capture_render winrt_capture_render;
+	PFN_winrt_capture_set_frame_callback winrt_capture_set_frame_callback;
+	PFN_winrt_capture_render_texture winrt_capture_render_texture;
 	PFN_winrt_capture_width winrt_capture_width;
 	PFN_winrt_capture_height winrt_capture_height;
 };
@@ -70,6 +75,9 @@ enum display_capture_method {
 
 struct duplicator_capture {
 	obs_source_t *source;
+	struct capture_worker worker;
+	struct capture_frame_buffer frame_buffer;
+	uint64_t capture_timestamp;
 	pthread_mutex_t update_mutex;
 	char monitor_id[128];
 	char id[128];
@@ -355,6 +363,7 @@ static void duplicator_actual_destroy(void *data)
 	}
 
 	cursor_data_free(&capture->cursor_data);
+	capture_frame_buffer_free(&capture->frame_buffer);
 
 	obs_leave_graphics();
 
@@ -370,11 +379,14 @@ static void duplicator_actual_destroy(void *data)
 
 static void duplicator_capture_destroy(void *data)
 {
+	struct duplicator_capture *capture = data;
+	capture_worker_free(&capture->worker);
 	obs_queue_task(OBS_TASK_GRAPHICS, duplicator_actual_destroy, data, false);
 }
 
 static void duplicator_capture_defaults(obs_data_t *settings)
 {
+	capture_frame_buffer_defaults(settings);
 	obs_data_set_default_int(settings, "method", METHOD_AUTO);
 	obs_data_set_default_string(settings, "monitor_id", INVALID_DISPLAY);
 	obs_data_set_default_int(settings, "monitor_wgc", 0);
@@ -385,10 +397,20 @@ static void duplicator_capture_defaults(obs_data_t *settings)
 static void duplicator_capture_update(void *data, obs_data_t *settings)
 {
 	struct duplicator_capture *mc = data;
+	pthread_mutex_lock(&mc->worker.mutex);
 	update_settings(mc, settings);
+	obs_enter_graphics();
+	if (mc->capture_winrt && mc->exports.winrt_capture_set_frame_callback)
+		mc->exports.winrt_capture_set_frame_callback(mc->capture_winrt, NULL, NULL);
+	capture_frame_buffer_clear(&mc->frame_buffer);
+	mc->worker.event_driven = mc->method == METHOD_WGC;
+	capture_frame_buffer_update(&mc->frame_buffer, &mc->worker, settings);
+	mc->capture_timestamp = 0;
+	obs_leave_graphics();
 	log_settings(mc, mc->monitor_name, mc->logged_width, mc->logged_height);
 
 	mc->reset_wgc = true;
+	pthread_mutex_unlock(&mc->worker.mutex);
 }
 
 #define WINRT_IMPORT(func)                                           \
@@ -414,6 +436,10 @@ static bool load_winrt_imports(struct winrt_exports *exports, void *module, cons
 	WINRT_IMPORT(winrt_capture_active);
 	WINRT_IMPORT(winrt_capture_get_color_space);
 	WINRT_IMPORT(winrt_capture_render);
+	exports->winrt_capture_set_frame_callback =
+		(PFN_winrt_capture_set_frame_callback)os_dlsym(module, "winrt_capture_set_frame_callback");
+	exports->winrt_capture_render_texture =
+		(PFN_winrt_capture_render_texture)os_dlsym(module, "winrt_capture_render_texture");
 	WINRT_IMPORT(winrt_capture_width);
 	WINRT_IMPORT(winrt_capture_height);
 
@@ -421,6 +447,8 @@ static bool load_winrt_imports(struct winrt_exports *exports, void *module, cons
 }
 
 extern bool graphics_uses_d3d11;
+
+static void duplicator_capture_buffered(void *data);
 
 static void *duplicator_capture_create(obs_data_t *settings, obs_source_t *source)
 {
@@ -430,6 +458,12 @@ static void *duplicator_capture_create(obs_data_t *settings, obs_source_t *sourc
 	capture->source = source;
 
 	pthread_mutex_init(&capture->update_mutex, NULL);
+	if (!capture_worker_init(&capture->worker, duplicator_capture_buffered, capture)) {
+		capture_worker_free(&capture->worker);
+		pthread_mutex_destroy(&capture->update_mutex);
+		bfree(capture);
+		return NULL;
+	}
 
 	if (graphics_uses_d3d11) {
 		static const char *const module = "libobs-winrt";
@@ -440,6 +474,10 @@ static void *duplicator_capture_create(obs_data_t *settings, obs_source_t *sourc
 	}
 
 	update_settings(capture, settings);
+	obs_enter_graphics();
+	capture->worker.event_driven = capture->method == METHOD_WGC;
+	capture_frame_buffer_update(&capture->frame_buffer, &capture->worker, settings);
+	obs_leave_graphics();
 	log_settings(capture, capture->monitor_name, capture->logged_width, capture->logged_height);
 
 	return capture;
@@ -466,6 +504,8 @@ static void reset_capture_data(struct duplicator_capture *capture)
 
 static void free_capture_data(struct duplicator_capture *capture)
 {
+	capture_frame_buffer_clear(&capture->frame_buffer);
+	capture->capture_timestamp = 0;
 	if (capture->capture_winrt) {
 		capture->exports.winrt_capture_free(capture->capture_winrt);
 		capture->capture_winrt = NULL;
@@ -491,7 +531,26 @@ static void update_monitor_handle(struct duplicator_capture *capture)
 	capture->handle = find_monitor(capture->monitor_id).handle;
 }
 
-static void duplicator_capture_tick(void *data, float seconds)
+static void duplicator_capture_buffered(void *data)
+{
+	struct duplicator_capture *capture = data;
+	if (capture->method == METHOD_WGC || !capture->duplicator || !obs_source_showing(capture->source))
+		return;
+	uint64_t timestamp = 0;
+	if (!gs_duplicator_poll_frame(capture->duplicator, &timestamp)) {
+		free_capture_data(capture);
+		return;
+	}
+	gs_texture_t *texture = gs_duplicator_get_texture(capture->duplicator);
+	if (!timestamp || timestamp == capture->capture_timestamp || !texture)
+		return;
+	capture->capture_timestamp = timestamp;
+	if (gs_texture_get_width(texture) != capture->width || gs_texture_get_height(texture) != capture->height)
+		reset_capture_data(capture);
+	capture_frame_buffer_push(&capture->frame_buffer, texture, timestamp);
+}
+
+static void duplicator_capture_tick_internal(void *data, float seconds)
 {
 	struct duplicator_capture *capture = data;
 
@@ -586,7 +645,7 @@ static void duplicator_capture_tick(void *data, float seconds)
 			if (capture->capture_cursor)
 				cursor_capture(&capture->cursor_data);
 
-			if (!gs_duplicator_update_frame(capture->duplicator)) {
+			if (!capture->frame_buffer.config.enabled && !gs_duplicator_update_frame(capture->duplicator)) {
 				free_capture_data(capture);
 
 			} else if (capture->width == 0) {
@@ -599,6 +658,31 @@ static void duplicator_capture_tick(void *data, float seconds)
 
 	if (!capture->showing)
 		capture->showing = true;
+}
+
+static void duplicator_capture_tick(void *data, float seconds)
+{
+	struct duplicator_capture *capture = data;
+	pthread_mutex_lock(&capture->worker.mutex);
+	duplicator_capture_tick_internal(data, seconds);
+	obs_enter_graphics();
+	if (capture->method == METHOD_WGC && capture->capture_winrt &&
+	    capture->exports.winrt_capture_set_frame_callback && capture->exports.winrt_capture_render_texture)
+		capture->exports.winrt_capture_set_frame_callback(
+			capture->capture_winrt, capture->frame_buffer.config.enabled ? capture_frame_buffer_push : NULL,
+			&capture->frame_buffer);
+	if (capture->method == METHOD_WGC) {
+		InterlockedExchange(&capture->worker.enabled, 0);
+		if (capture->frame_buffer.config.enabled && (!capture->exports.winrt_capture_set_frame_callback ||
+							     !capture->exports.winrt_capture_render_texture)) {
+			warn("Frame-count buffering requires an updated libobs-winrt.");
+			capture->frame_buffer.config.enabled = false;
+		}
+	}
+	if (obs_source_showing(capture->source))
+		capture_frame_buffer_tick(&capture->frame_buffer, capture->source);
+	obs_leave_graphics();
+	pthread_mutex_unlock(&capture->worker.mutex);
 }
 
 static uint32_t duplicator_capture_width(void *data)
@@ -631,8 +715,13 @@ static void duplicator_capture_render(void *data, gs_effect_t *unused)
 	if (capture->method == METHOD_WGC) {
 		if (capture->capture_winrt) {
 			if (capture->exports.winrt_capture_active(capture->capture_winrt)) {
-				capture->exports.winrt_capture_render(capture->capture_winrt);
+				if (capture->frame_buffer.config.enabled)
+					capture->exports.winrt_capture_render_texture(capture->capture_winrt,
+										      capture->frame_buffer.selected);
+				else
+					capture->exports.winrt_capture_render(capture->capture_winrt);
 			} else {
+				capture_frame_buffer_clear(&capture->frame_buffer);
 				capture->exports.winrt_capture_free(capture->capture_winrt);
 				capture->capture_winrt = NULL;
 			}
@@ -641,7 +730,9 @@ static void duplicator_capture_render(void *data, gs_effect_t *unused)
 		if (!capture->duplicator)
 			return;
 
-		gs_texture_t *const texture = gs_duplicator_get_texture(capture->duplicator);
+		gs_texture_t *const texture = capture->frame_buffer.config.enabled
+						      ? capture->frame_buffer.selected
+						      : gs_duplicator_get_texture(capture->duplicator);
 		if (!texture)
 			return;
 
@@ -817,6 +908,7 @@ static obs_properties_t *duplicator_capture_properties(void *data)
 
 	obs_properties_add_bool(props, "capture_cursor", TEXT_CAPTURE_CURSOR);
 	obs_properties_add_bool(props, "force_sdr", TEXT_FORCE_SDR);
+	capture_frame_buffer_properties(props);
 
 	EnumDisplayMonitors(NULL, NULL, enum_monitor_props, (LPARAM)monitors);
 

@@ -18,6 +18,7 @@
 #include "cursor-capture.h"
 #include "app-helpers.h"
 #include "audio-helpers.h"
+#include "capture-frame-buffer.h"
 #include "nt-stuff.h"
 
 #define do_log(level, format, ...) \
@@ -120,6 +121,11 @@ typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetWindowDpiAwarenessContext)(HWND);
 
 struct game_capture {
 	obs_source_t *source;
+	struct capture_worker worker;
+	struct capture_frame_buffer frame_buffer;
+	uint64_t capture_timestamp;
+	bool buffer_warning;
+	bool buffer_registered;
 	obs_source_t *audio_source;
 
 	struct cursor_data cursor_data;
@@ -309,6 +315,17 @@ static inline float hook_rate_to_float(enum hook_rate rate)
 	}
 }
 
+static void update_frame_buffer_request(struct game_capture *gc, bool enabled)
+{
+	if (!gc->global_hook_info || gc->buffer_registered == enabled)
+		return;
+	if (enabled)
+		InterlockedIncrement(&gc->global_hook_info->frame_buffer_requested);
+	else
+		InterlockedDecrement(&gc->global_hook_info->frame_buffer_requested);
+	gc->buffer_registered = enabled;
+}
+
 static void stop_capture(struct game_capture *gc)
 {
 	ipc_pipe_server_free(&gc->pipe);
@@ -317,6 +334,7 @@ static void stop_capture(struct game_capture *gc)
 		SetEvent(gc->hook_stop);
 	}
 	if (gc->global_hook_info) {
+		update_frame_buffer_request(gc, false);
 		UnmapViewOfFile(gc->global_hook_info);
 		gc->global_hook_info = NULL;
 	}
@@ -343,6 +361,9 @@ static void stop_capture(struct game_capture *gc)
 	close_handle(&gc->texture_mutexes[1]);
 
 	obs_enter_graphics();
+	capture_frame_buffer_clear(&gc->frame_buffer);
+	gc->capture_timestamp = 0;
+	gc->buffer_warning = false;
 	gs_texrender_destroy(gc->extra_texrender);
 	gc->extra_texrender = NULL;
 	gs_texture_destroy(gc->extra_texture);
@@ -387,6 +408,7 @@ static inline void free_config(struct game_capture_config *config)
 static void game_capture_destroy(void *data)
 {
 	struct game_capture *gc = data;
+	capture_worker_free(&gc->worker);
 	stop_capture(gc);
 
 	if (gc->audio_source)
@@ -400,6 +422,7 @@ static void game_capture_destroy(void *data)
 
 	obs_enter_graphics();
 	cursor_data_free(&gc->cursor_data);
+	capture_frame_buffer_free(&gc->frame_buffer);
 	obs_leave_graphics();
 
 	dstr_free(&gc->title);
@@ -533,6 +556,22 @@ static void game_capture_get_hooked(void *data, calldata_t *cd)
 static void game_capture_update(void *data, obs_data_t *settings)
 {
 	struct game_capture *gc = data;
+	pthread_mutex_lock(&gc->worker.mutex);
+	obs_enter_graphics();
+	capture_frame_buffer_clear(&gc->frame_buffer);
+	capture_frame_buffer_update(&gc->frame_buffer, &gc->worker, settings);
+	gc->capture_timestamp = 0;
+	if (gc->global_hook_info) {
+		update_frame_buffer_request(gc, gc->frame_buffer.config.enabled);
+		if (gc->global_hook_info->frame_buffer_version == 1) {
+			for (size_t index = 0; index < 3; index++) {
+				const uint64_t timestamp = hook_frame_timestamp(&gc->global_hook_info->frames[index]);
+				if (timestamp > gc->capture_timestamp)
+					gc->capture_timestamp = timestamp;
+			}
+		}
+	}
+	obs_leave_graphics();
 	struct game_capture_config cfg;
 	bool reset_capture = false;
 	const char *window = obs_data_get_string(settings, SETTING_CAPTURE_WINDOW);
@@ -576,13 +615,27 @@ static void game_capture_update(void *data, obs_data_t *settings)
 	/* Linked audio capture source stuff */
 	setup_audio_source(gc->source, &gc->audio_source, cfg.mode == CAPTURE_MODE_WINDOW ? window : NULL,
 			   cfg.capture_audio, cfg.priority);
+	pthread_mutex_unlock(&gc->worker.mutex);
 }
 
 extern void wait_for_hook_initialization(void);
 
+static void game_capture_buffered(void *data);
+
+static bool game_buffering_ready(struct game_capture *gc)
+{
+	return gc->frame_buffer.config.enabled && gc->global_hook_info &&
+	       gc->global_hook_info->frame_buffer_version == 1;
+}
+
 static void *game_capture_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct game_capture *gc = bzalloc(sizeof(*gc));
+	if (!capture_worker_init(&gc->worker, game_capture_buffered, gc)) {
+		capture_worker_free(&gc->worker);
+		bfree(gc);
+		return NULL;
+	}
 
 	wait_for_hook_initialization();
 
@@ -758,6 +811,7 @@ static inline void reset_frame_interval(struct game_capture *gc)
 {
 	struct obs_video_info ovi;
 	uint64_t interval = 0;
+	update_frame_buffer_request(gc, gc->frame_buffer.config.enabled);
 
 	if (obs_get_video_info(&ovi)) {
 		interval = util_mul_div64(ovi.fps_den, 1000000000ULL, ovi.fps_num);
@@ -766,7 +820,8 @@ static inline void reset_frame_interval(struct game_capture *gc)
 		 * running at 900 FPS is being captured without some sort of
 		 * limited capture interval, it will dramatically reduce
 		 * performance. */
-		if (!gc->config.limit_framerate)
+		if (!gc->config.limit_framerate ||
+		    InterlockedCompareExchange(&gc->global_hook_info->frame_buffer_requested, 0, 0))
 			interval /= 2;
 	}
 
@@ -1518,6 +1573,13 @@ static void copy_shmem_tex(struct game_capture *gc)
 		return;
 	}
 
+	const uint64_t timestamp =
+		game_buffering_ready(gc) ? hook_frame_timestamp(&gc->global_hook_info->frames[cur_texture + 1]) : 0;
+	if (game_buffering_ready(gc) && (!timestamp || timestamp <= gc->capture_timestamp)) {
+		ReleaseMutex(mutex);
+		return;
+	}
+	bool copied = false;
 	if (gs_texture_map(gc->texture, &data, &pitch)) {
 		if (gc->convert_16bit) {
 			copy_16bit_tex(gc, cur_texture, data, pitch);
@@ -1536,9 +1598,14 @@ static void copy_shmem_tex(struct game_capture *gc)
 		}
 
 		gs_texture_unmap(gc->texture);
+		copied = true;
 	}
 
 	ReleaseMutex(mutex);
+	if (copied && game_buffering_ready(gc)) {
+		capture_frame_buffer_push(&gc->frame_buffer, gc->texture, timestamp);
+		gc->capture_timestamp = timestamp;
+	}
 }
 
 static inline bool is_16bit_format(uint32_t format)
@@ -1697,7 +1764,23 @@ static void check_foreground_window(struct game_capture *gc, float seconds)
 	}
 }
 
-static void game_capture_tick(void *data, float seconds)
+static void game_capture_buffered(void *data)
+{
+	struct game_capture *gc = data;
+	if (!gc->active || !gc->texture || !game_buffering_ready(gc) || !obs_source_showing(gc->source))
+		return;
+	if (gc->copy_texture) {
+		gc->copy_texture(gc);
+	} else {
+		const uint64_t timestamp = hook_frame_timestamp(&gc->global_hook_info->frames[0]);
+		if (timestamp && timestamp > gc->capture_timestamp) {
+			capture_frame_buffer_push(&gc->frame_buffer, gc->texture, timestamp);
+			gc->capture_timestamp = timestamp;
+		}
+	}
+}
+
+static void game_capture_tick_internal(void *data, float seconds)
 {
 	struct game_capture *gc = data;
 	bool deactivate = os_atomic_set_bool(&gc->deactivate_hook, false);
@@ -1816,7 +1899,7 @@ static void game_capture_tick(void *data, float seconds)
 			     "terminating capture");
 			stop_capture(gc);
 		} else {
-			if (gc->copy_texture) {
+			if (gc->copy_texture && !game_buffering_ready(gc)) {
 				obs_enter_graphics();
 				gc->copy_texture(gc);
 				obs_leave_graphics();
@@ -1850,6 +1933,23 @@ static void game_capture_tick(void *data, float seconds)
 
 	if (!gc->showing)
 		gc->showing = true;
+}
+
+static void game_capture_tick(void *data, float seconds)
+{
+	struct game_capture *gc = data;
+	pthread_mutex_lock(&gc->worker.mutex);
+	game_capture_tick_internal(data, seconds);
+	obs_enter_graphics();
+	if (gc->active && gc->frame_buffer.config.enabled && !game_buffering_ready(gc) && !gc->buffer_warning) {
+		warn("Frame-count buffering requires the updated graphics hook; restart the captured application. "
+		     "Using unbuffered capture until then.");
+		gc->buffer_warning = true;
+	}
+	if (gc->active && game_buffering_ready(gc))
+		capture_frame_buffer_tick(&gc->frame_buffer, gc->source);
+	obs_leave_graphics();
+	pthread_mutex_unlock(&gc->worker.mutex);
 }
 
 static inline void game_capture_render_cursor(struct game_capture *gc)
@@ -1887,7 +1987,9 @@ static void game_capture_render(void *data, gs_effect_t *unused)
 	const bool allow_transparency = gc->config.allow_transparency;
 	gs_effect_t *const effect = obs_get_base_effect(allow_transparency ? OBS_EFFECT_DEFAULT : OBS_EFFECT_OPAQUE);
 
-	gs_texture_t *texture = gc->texture;
+	gs_texture_t *texture = game_buffering_ready(gc) ? gc->frame_buffer.selected : gc->texture;
+	if (!texture)
+		return;
 	enum gs_color_space source_space = GS_CS_SRGB;
 	bool is_10a2_compressed = false;
 	if (gs_texture_get_color_format(texture) == GS_R10G10B10A2) {
@@ -2106,6 +2208,7 @@ static const char *game_capture_name(void *unused)
 
 static void game_capture_defaults(obs_data_t *settings)
 {
+	capture_frame_buffer_defaults(settings);
 	obs_data_set_default_string(settings, SETTING_MODE, SETTING_MODE_ANY);
 	obs_data_set_default_int(settings, SETTING_WINDOW_PRIORITY, (int)WINDOW_PRIORITY_EXE);
 	obs_data_set_default_bool(settings, SETTING_COMPATIBILITY, false);
@@ -2287,6 +2390,7 @@ static obs_properties_t *game_capture_properties(void *data)
 				    OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, TEXT_RGBA10A2_SPACE_SRGB, RGBA10A2_SPACE_SRGB);
 	obs_property_list_add_string(p, TEXT_RGBA10A2_SPACE_2100PQ, RGBA10A2_SPACE_2100PQ);
+	capture_frame_buffer_properties(ppts);
 
 	return ppts;
 }

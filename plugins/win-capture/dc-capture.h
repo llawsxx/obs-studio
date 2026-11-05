@@ -30,5 +30,6 @@ extern void dc_capture_init(struct dc_capture *capture, int x, int y, uint32_t w
 			    bool compatibility);
 extern void dc_capture_free(struct dc_capture *capture);
 
-extern void dc_capture_capture(struct dc_capture *capture, HWND window);
+extern bool dc_capture_capture(struct dc_capture *capture, HWND window);
 extern void dc_capture_render(struct dc_capture *capture, bool texcoords_centered);
+extern void dc_capture_render_texture(struct dc_capture *capture, bool texcoords_centered, gs_texture_t *texture);

@@ -76,6 +76,7 @@ extern bool capture_init_shtex(struct shtex_data **data, HWND window, uint32_t c
 extern bool capture_init_shmem(struct shmem_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t pitch,
 			       uint32_t format, bool flip);
 extern void capture_free(void);
+extern void capture_publish_frame(size_t slot);
 
 extern struct hook_info *global_hook_info;
 

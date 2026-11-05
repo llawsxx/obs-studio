@@ -767,6 +767,7 @@ struct gs_duplicator : gs_obj {
 	int idx;
 	long refs;
 	bool updated;
+	uint64_t frame_timestamp = 0;
 
 	void Start();
 

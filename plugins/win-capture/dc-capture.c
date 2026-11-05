@@ -148,7 +148,7 @@ static inline void dc_capture_release_dc(struct dc_capture *capture)
 	}
 }
 
-void dc_capture_capture(struct dc_capture *capture, HWND window)
+bool dc_capture_capture(struct dc_capture *capture, HWND window)
 {
 	HDC hdc_target;
 	HDC hdc;
@@ -163,14 +163,16 @@ void dc_capture_capture(struct dc_capture *capture, HWND window)
 	if (!hdc) {
 		blog(LOG_WARNING, "[capture_screen] Failed to get "
 				  "texture DC");
-		return;
+		return false;
 	}
 
 	hdc_target = GetDC(window);
 
-	BitBlt(hdc, 0, 0, capture->width, capture->height, hdc_target, capture->x, capture->y, SRCCOPY);
+	const bool captured = hdc_target && BitBlt(hdc, 0, 0, capture->width, capture->height, hdc_target, capture->x,
+						   capture->y, SRCCOPY);
 
-	ReleaseDC(NULL, hdc_target);
+	if (hdc_target)
+		ReleaseDC(window, hdc_target);
 
 	if (capture->cursor_captured && !capture->cursor_hidden)
 		draw_cursor(capture, hdc, window);
@@ -178,12 +180,19 @@ void dc_capture_capture(struct dc_capture *capture, HWND window)
 	dc_capture_release_dc(capture);
 
 	capture->texture_written = true;
+	return captured;
 }
 
 void dc_capture_render(struct dc_capture *capture, bool texcoords_centered)
 {
+	dc_capture_render_texture(capture, texcoords_centered, capture->texture);
+}
+
+void dc_capture_render_texture(struct dc_capture *capture, bool texcoords_centered, gs_texture_t *texture)
+{
 	if (capture->valid && capture->texture_written) {
-		gs_texture_t *texture = capture->texture;
+		if (!texture)
+			return;
 		const bool compatibility = capture->compatibility;
 		bool linear_sample = compatibility;
 		if (!linear_sample && !texcoords_centered) {

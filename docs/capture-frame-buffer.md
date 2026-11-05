@@ -86,8 +86,10 @@ native-epoch DirectShow audio timestamps. It does not implement a new audio
 buffer, audio resampling clock, or independent audio retimestamping; verify A/V
 sync with the actual capture device and adjust the audio sync offset if needed.
 
-The new UI is specific to Windows DirectShow. The opt-in libobs API can support
-other asynchronous video sources, but no other source is automatically changed.
+This UI is specific to Windows DirectShow. Windows window, display and game
+capture have a separate opt-in GPU queue described in
+`windows-capture-frame-buffer.md`. The opt-in libobs API can support other
+asynchronous video sources; no other source is automatically changed.
 Normal and deinterlaced async selection both use the new scheduler when enabled.
 This happens before scene composition, so it affects preview, recording,
 streaming, and virtual camera, unlike buffered preview presentation.

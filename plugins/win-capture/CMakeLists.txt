@@ -33,6 +33,8 @@ target_sources(
     app-helpers.h
     audio-helpers.c
     audio-helpers.h
+    capture-frame-buffer.c
+    capture-frame-buffer.h
     compat-format-ver.h
     compat-helpers.c
     compat-helpers.h
@@ -84,3 +86,13 @@ set_target_properties_obs(win-capture PROPERTIES FOLDER plugins/win-capture PREF
 add_subdirectory(graphics-hook)
 add_subdirectory(get-graphics-offsets)
 add_subdirectory(inject-helper)
+
+add_executable(
+  capture-buffer-tests EXCLUDE_FROM_ALL
+  "${CMAKE_SOURCE_DIR}/test/test_capture_frame_buffer.cpp"
+  capture-frame-buffer.c
+)
+target_include_directories(capture-buffer-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(capture-buffer-tests PRIVATE cxx_std_17)
+target_link_libraries(capture-buffer-tests PRIVATE OBS::libobs OBS::w32-pthreads OBS::hook-config OBS::winrt-headers)
+set_target_properties(capture-buffer-tests PROPERTIES FOLDER tests)

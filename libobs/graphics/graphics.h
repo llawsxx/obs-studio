@@ -866,6 +866,7 @@ EXPORT gs_duplicator_t *gs_duplicator_create(int monitor_idx);
 EXPORT void gs_duplicator_destroy(gs_duplicator_t *duplicator);
 
 EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *duplicator);
+EXPORT bool gs_duplicator_poll_frame(gs_duplicator_t *duplicator, uint64_t *timestamp);
 EXPORT gs_texture_t *gs_duplicator_get_texture(gs_duplicator_t *duplicator);
 EXPORT enum gs_color_space gs_duplicator_get_color_space(gs_duplicator_t *duplicator);
 EXPORT float gs_duplicator_get_sdr_white_level(gs_duplicator_t *duplicator);

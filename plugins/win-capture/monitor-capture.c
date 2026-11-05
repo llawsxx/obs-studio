@@ -1,5 +1,6 @@
 #include <util/dstr.h>
 #include "dc-capture.h"
+#include "capture-frame-buffer.h"
 
 /* clang-format off */
 
@@ -12,6 +13,8 @@
 /* clang-format on */
 
 struct monitor_capture {
+	struct capture_worker worker;
+	struct capture_frame_buffer frame_buffer;
 	obs_source_t *source;
 
 	int monitor;
@@ -97,9 +100,11 @@ static const char *monitor_capture_getname(void *unused)
 static void monitor_capture_destroy(void *data)
 {
 	struct monitor_capture *capture = data;
+	capture_worker_free(&capture->worker);
 
 	obs_enter_graphics();
 	dc_capture_free(&capture->data);
+	capture_frame_buffer_free(&capture->frame_buffer);
 	obs_leave_graphics();
 
 	bfree(capture);
@@ -107,6 +112,7 @@ static void monitor_capture_destroy(void *data)
 
 static void monitor_capture_defaults(obs_data_t *settings)
 {
+	capture_frame_buffer_defaults(settings);
 	obs_data_set_default_int(settings, "monitor", 0);
 	obs_data_set_default_bool(settings, "capture_cursor", true);
 	obs_data_set_default_bool(settings, "compatibility", false);
@@ -115,7 +121,23 @@ static void monitor_capture_defaults(obs_data_t *settings)
 static void monitor_capture_update(void *data, obs_data_t *settings)
 {
 	struct monitor_capture *mc = data;
+	pthread_mutex_lock(&mc->worker.mutex);
+	obs_enter_graphics();
 	update_settings(mc, settings);
+	capture_frame_buffer_clear(&mc->frame_buffer);
+	capture_frame_buffer_update(&mc->frame_buffer, &mc->worker, settings);
+	obs_leave_graphics();
+	pthread_mutex_unlock(&mc->worker.mutex);
+}
+
+static void monitor_capture_buffered(void *data)
+{
+	struct monitor_capture *capture = data;
+	if (!obs_source_showing(capture->source) || !capture->data.valid ||
+	    !capture_frame_buffer_due(&capture->frame_buffer, os_gettime_ns()))
+		return;
+	if (dc_capture_capture(&capture->data, NULL))
+		capture_frame_buffer_push(&capture->frame_buffer, capture->data.texture, os_gettime_ns());
 }
 
 static void *monitor_capture_create(obs_data_t *settings, obs_source_t *source)
@@ -124,8 +146,13 @@ static void *monitor_capture_create(obs_data_t *settings, obs_source_t *source)
 
 	capture = bzalloc(sizeof(struct monitor_capture));
 	capture->source = source;
+	if (!capture_worker_init(&capture->worker, monitor_capture_buffered, capture)) {
+		capture_worker_free(&capture->worker);
+		bfree(capture);
+		return NULL;
+	}
 
-	update_settings(capture, settings);
+	monitor_capture_update(capture, settings);
 
 	return capture;
 }
@@ -137,9 +164,14 @@ static void monitor_capture_tick(void *data, float seconds)
 	if (!obs_source_showing(capture->source))
 		return;
 
+	pthread_mutex_lock(&capture->worker.mutex);
 	obs_enter_graphics();
-	dc_capture_capture(&capture->data, NULL);
+	if (capture->frame_buffer.config.enabled)
+		capture_frame_buffer_tick(&capture->frame_buffer, capture->source);
+	else
+		dc_capture_capture(&capture->data, NULL);
 	obs_leave_graphics();
+	pthread_mutex_unlock(&capture->worker.mutex);
 
 	UNUSED_PARAMETER(seconds);
 }
@@ -147,7 +179,11 @@ static void monitor_capture_tick(void *data, float seconds)
 static void monitor_capture_render(void *data, gs_effect_t *effect)
 {
 	struct monitor_capture *capture = data;
-	dc_capture_render(&capture->data, obs_source_get_texcoords_centered(capture->source));
+	if (capture->frame_buffer.config.enabled)
+		dc_capture_render_texture(&capture->data, obs_source_get_texcoords_centered(capture->source),
+					  capture->frame_buffer.selected);
+	else
+		dc_capture_render(&capture->data, obs_source_get_texcoords_centered(capture->source));
 
 	UNUSED_PARAMETER(effect);
 }
@@ -211,6 +247,7 @@ static obs_properties_t *monitor_capture_properties(void *unused)
 
 	obs_properties_add_bool(props, "compatibility", TEXT_COMPATIBILITY);
 	obs_properties_add_bool(props, "capture_cursor", TEXT_CAPTURE_CURSOR);
+	capture_frame_buffer_properties(props);
 
 	EnumDisplayMonitors(NULL, NULL, enum_monitor_props, (LPARAM)monitors);
 

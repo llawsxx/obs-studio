@@ -103,6 +103,9 @@ struct winrt_capture {
 
 	gs_texture_t *texture;
 	bool texture_written;
+	bool closing = false;
+	winrt_capture_frame_callback frame_callback = nullptr;
+	void *frame_param = nullptr;
 	winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
 	winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice device{nullptr};
 	ComPtr<ID3D11DeviceContext> context;
@@ -139,6 +142,10 @@ struct winrt_capture {
 		frame_surface->GetDesc(&desc);
 
 		obs_enter_graphics();
+		if (closing) {
+			obs_leave_graphics();
+			return;
+		}
 
 		if (desc.Format == get_pixel_format(window, monitor, force_sdr)) {
 			if (!client_area || get_client_box(window, desc.Width, desc.Height, &client_box)) {
@@ -175,6 +182,10 @@ struct winrt_capture {
 				}
 
 				texture_written = true;
+				if (frame_callback) {
+					frame_callback(frame_param, texture,
+						       (uint64_t)frame.SystemRelativeTime().count() * 100);
+				}
 			}
 
 			if (frame_content_size.Width != last_size.Width ||
@@ -203,6 +214,11 @@ static void winrt_capture_device_loss_release(void *data)
 	capture->active = FALSE;
 
 	capture->frame_arrived.revoke();
+	obs_enter_graphics();
+	if (capture->frame_callback) {
+		capture->frame_callback(capture->frame_param, nullptr, 0);
+	}
+	obs_leave_graphics();
 
 	try {
 		capture->frame_pool.Close();
@@ -460,6 +476,9 @@ extern "C" EXPORT void winrt_capture_free(struct winrt_capture *capture)
 
 		obs_enter_graphics();
 		gs_unregister_loss_callbacks(capture);
+		capture->closing = true;
+		capture->frame_callback = nullptr;
+		capture->frame_param = nullptr;
 		gs_texture_destroy(capture->texture);
 		obs_leave_graphics();
 
@@ -527,7 +546,19 @@ extern "C" EXPORT enum gs_color_space winrt_capture_get_color_space(const struct
 
 extern "C" EXPORT void winrt_capture_render(struct winrt_capture *capture)
 {
-	if (capture->texture_written) {
+	winrt_capture_render_texture(capture, capture->texture_written ? capture->texture : nullptr);
+}
+
+extern "C" EXPORT void winrt_capture_set_frame_callback(struct winrt_capture *capture,
+							winrt_capture_frame_callback callback, void *param)
+{
+	capture->frame_callback = callback;
+	capture->frame_param = param;
+}
+
+extern "C" EXPORT void winrt_capture_render_texture(struct winrt_capture *capture, gs_texture_t *texture)
+{
+	if (texture) {
 		const char *tech_name = "Draw";
 		float multiplier = 1.f;
 		const gs_color_space current_space = gs_get_color_space();
@@ -556,7 +587,6 @@ extern "C" EXPORT void winrt_capture_render(struct winrt_capture *capture)
 		gs_blend_state_push();
 		gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
-		gs_texture_t *const texture = capture->texture;
 		gs_effect_set_texture_srgb(gs_effect_get_param_by_name(effect, "image"), texture);
 		gs_effect_set_float(gs_effect_get_param_by_name(effect, "multiplier"), multiplier);
 

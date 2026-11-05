@@ -3160,6 +3160,15 @@ void gs_duplicator_destroy(gs_duplicator_t *duplicator)
 	thread_graphics->exports.gs_duplicator_destroy(duplicator);
 }
 
+bool gs_duplicator_poll_frame(gs_duplicator_t *duplicator, uint64_t *timestamp)
+{
+	if (!gs_valid_p("gs_duplicator_poll_frame", duplicator) || !timestamp)
+		return false;
+	if (!thread_graphics->exports.gs_duplicator_poll_frame)
+		return false;
+	return thread_graphics->exports.gs_duplicator_poll_frame(duplicator, timestamp);
+}
+
 bool gs_duplicator_update_frame(gs_duplicator_t *duplicator)
 {
 	if (!gs_valid_p("gs_duplicator_update_frame", duplicator))
