@@ -1,0 +1,175 @@
+name: Manual Windows Release
+run-name: Windows x64 Release from ${{ inputs.source_ref }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit to build
+        type: string
+        required: true
+        default: dev
+      create_release:
+        description: Create a draft prerelease with the build files
+        type: boolean
+        required: false
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      commit_sha: ${{ steps.source.outputs.commit_sha }}
+      short_sha: ${{ steps.source.outputs.short_sha }}
+      artifact_name: ${{ steps.source.outputs.artifact_name }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+    steps:
+      - name: Check Out Source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Ensure OBS Version Tags
+        run: |
+          $versionTags = @(git tag --merged HEAD --list '[0-9]*.[0-9]*.[0-9]*')
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not inspect source version tags'
+          }
+          if ($versionTags.Count -eq 0) {
+            git fetch --no-tags --no-recurse-submodules `
+              https://github.com/obsproject/obs-studio.git 'refs/tags/*:refs/tags/*'
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Could not fetch OBS version tags from the upstream repository'
+            }
+          }
+
+      - name: Resolve Build Source
+        id: source
+        run: |
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not resolve the source commit'
+          }
+          $versionTag = git describe --tags --match '[0-9]*.[0-9]*.[0-9]*' --abbrev=0
+          if ($LASTEXITCODE -ne 0) {
+            throw 'No OBS version tag is reachable from the selected source commit after fetching upstream tags'
+          }
+          $version = [regex]::Match($versionTag, '^\d+\.\d+\.\d+').Value
+          if (-not $version) {
+            throw "Cannot determine the OBS version from $versionTag"
+          }
+          $shortCommit = $commit.Substring(0, 9)
+          $runIdentifier = "${env:GITHUB_RUN_ID}.${env:GITHUB_RUN_ATTEMPT}"
+          @(
+            "commit_sha=$commit"
+            "short_sha=$shortCommit"
+            "artifact_name=obs-studio-windows-x64-${shortCommit}-${runIdentifier}"
+            "release_tag=${version}-dev.${shortCommit}.${runIdentifier}"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build OBS Studio
+        uses: ./.github/actions/build-obs
+        env:
+          TWITCH_CLIENTID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_HASH: ${{ secrets.TWITCH_HASH }}
+          RESTREAM_CLIENTID: ${{ secrets.RESTREAM_CLIENTID }}
+          RESTREAM_HASH: ${{ secrets.RESTREAM_HASH }}
+          YOUTUBE_CLIENTID: ${{ secrets.YOUTUBE_CLIENTID }}
+          YOUTUBE_CLIENTID_HASH: ${{ secrets.YOUTUBE_CLIENTID_HASH }}
+          YOUTUBE_SECRET: ${{ secrets.YOUTUBE_SECRET }}
+          YOUTUBE_SECRET_HASH: ${{ secrets.YOUTUBE_SECRET_HASH }}
+          GPU_PRIORITY_VAL: ${{ secrets.GPU_PRIORITY_VAL }}
+        with:
+          target: x64
+          config: Release
+
+      - name: Package OBS Studio
+        uses: ./.github/actions/package-obs
+        with:
+          target: x64
+          config: Release
+          package: true
+
+      - name: Prepare Release Files
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          COMMIT_SHA: ${{ steps.source.outputs.commit_sha }}
+          SHORT_SHA: ${{ steps.source.outputs.short_sha }}
+        run: |
+          $packages = @(Get-ChildItem -Path build_x64 -Filter 'obs-studio-*-windows-x64.zip' -File)
+          if ($packages.Count -ne 1) {
+            throw "Expected one Windows x64 ZIP package, found $($packages.Count)"
+          }
+          $directory = New-Item -ItemType Directory -Path release-artifacts
+          $fileName = "OBS-Studio-${env:SHORT_SHA}-Windows-x64.zip"
+          $destination = Join-Path $directory.FullName $fileName
+          Copy-Item -LiteralPath $packages[0].FullName -Destination $destination
+          $checksum = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  $fileName" | Set-Content -Path (Join-Path $directory.FullName 'SHA256SUMS.txt') -Encoding utf8
+          @(
+            "Source ref: $env:SOURCE_REF"
+            "Source commit: $env:COMMIT_SHA"
+            'Platform: Windows x64'
+            'Configuration: Release'
+            'Signing: unsigned'
+          ) | Set-Content -Path (Join-Path $directory.FullName 'BUILD-INFO.txt') -Encoding utf8
+          @(
+            '### Windows x64 development build'
+            "Source ref: $env:SOURCE_REF"
+            "Source commit: $env:COMMIT_SHA"
+            'Configuration: Release; unsigned ZIP package.'
+            'Download the ZIP, SHA256SUMS.txt, and BUILD-INFO.txt from the workflow artifacts.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload Build Files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ steps.source.outputs.artifact_name }}
+          path: release-artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Create Draft Prerelease
+    if: inputs.create_release
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Build Files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release-artifacts
+
+      - name: Create Draft Prerelease
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
+        with:
+          tag_name: ${{ needs.build.outputs.release_tag }}
+          target_commitish: ${{ needs.build.outputs.commit_sha }}
+          name: OBS Studio development build (${{ needs.build.outputs.short_sha }})
+          draft: true
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          body: |
+            Unsigned Windows x64 development build from `${{ inputs.source_ref }}`.
+
+            Source commit: `${{ needs.build.outputs.commit_sha }}`
+            Build configuration: `Release`
+
+            Includes the ZIP package, SHA256 checksums, and source build information.
+            This is a custom development build, not an official OBS Project release.
+          files: |
+            release-artifacts/*.zip
+            release-artifacts/SHA256SUMS.txt
+            release-artifacts/BUILD-INFO.txt
